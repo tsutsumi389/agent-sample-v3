@@ -18,7 +18,6 @@ class Task(TypedDict):
     id: str
     instruction: str
     parallel_group: int
-    depends_on: list[str]
 
 
 class TaskResult(TypedDict):
@@ -30,7 +29,6 @@ class TaskResult(TypedDict):
 class Evaluation(TypedDict):
     passed: bool
     feedback: str
-    retry_instructions: list[str]
 
 
 # --- 親グラフ(オーケストレータ) -------------------------------------------
@@ -70,4 +68,4 @@ class EvaluatorState(TypedDict, total=False):
 
 
 def empty_evaluation() -> Evaluation:
-    return {"passed": True, "feedback": "", "retry_instructions": []}
+    return {"passed": True, "feedback": ""}

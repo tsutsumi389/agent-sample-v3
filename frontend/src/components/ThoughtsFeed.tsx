@@ -1,12 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { ThoughtEntry } from "../types";
-
-const AGENT_LABELS: Record<string, string> = {
-  planner: "プランナー",
-  executor: "エグゼキューター",
-  evaluator: "エヴァリュエーター",
-  finalize: "最終統合",
-};
+import { NODE_LABELS } from "../labels";
 
 export function ThoughtsFeed({ thoughts }: { thoughts: ThoughtEntry[] }) {
   const endRef = useRef<HTMLDivElement>(null);
@@ -23,7 +17,7 @@ export function ThoughtsFeed({ thoughts }: { thoughts: ThoughtEntry[] }) {
       {thoughts.map((t, i) => (
         <div key={i} className="thought">
           <div className="thought-head">
-            {AGENT_LABELS[t.agent] ?? t.agent}
+            {NODE_LABELS[t.agent] ?? t.agent}
             {t.taskId && <span className="tid">#{t.taskId}</span>}
           </div>
           <div className="thought-body">{t.content}</div>

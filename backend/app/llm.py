@@ -16,11 +16,13 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from .config import settings
 
 
+@lru_cache(maxsize=None)
 def get_chat_llm(*, streaming: bool = True, temperature: float = 0.0) -> ChatOllama:
-    """エージェント用の ChatOllama を生成する。
+    """エージェント用の ChatOllama を生成する(引数ごとにキャッシュ)。
 
-    各エージェントは同じモデルを使うが、インスタンスは独立。会話履歴は
-    一切共有せず、呼び出しごとに渡されたメッセージのみで推論する。
+    ChatOllama はステートレス(astream は渡したメッセージのみで推論)なので
+    全エージェントでインスタンスを共有して安全。会話履歴は一切共有しない。
+    reasoning 値のバージョン解決(下のフォールバック)も初回呼び出し時のみ走る。
     """
     base = dict(
         model=settings.chat_model,

@@ -29,7 +29,6 @@ export interface ChatState {
   running: boolean;
   currentNode: string | null;
   statusMessage: string;
-  plan: AgentTask[];
   tasks: AgentTask[];
   thoughts: ThoughtEntry[];
   memories: string[];

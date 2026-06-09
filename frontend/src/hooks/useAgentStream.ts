@@ -6,7 +6,6 @@ const initialState: ChatState = {
   running: false,
   currentNode: null,
   statusMessage: "",
-  plan: [],
   tasks: [],
   thoughts: [],
   memories: [],
@@ -59,7 +58,7 @@ function applyEvent(state: ChatState, ev: AgentEvent): ChatState {
         status: "pending",
         parallelGroup: t.parallel_group,
       }));
-      return { ...state, plan: tasks, tasks };
+      return { ...state, tasks };
     }
     case "task_update": {
       const tasks = state.tasks.map((t) =>
