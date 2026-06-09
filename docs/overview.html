@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>システム概要 — LangGraph オーケストレータ 設計書</title>
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">LangGraph オーケストレータ
+        <span class="sub">設計書 / Design Docs</span>
+      </a>
+      <nav>
+        <div class="group-title">概観</div>
+        <a href="overview.html" class="active">システム概要</a>
+        <a href="architecture.html">アーキテクチャ</a>
+        <div class="group-title">詳細設計</div>
+        <a href="backend-design.html">バックエンド設計</a>
+        <a href="frontend-design.html">フロントエンド設計</a>
+        <a href="memory-design.html">長期記憶設計</a>
+        <div class="group-title">インタフェース</div>
+        <a href="api-spec.html">API / SSE 仕様</a>
+        <a href="sequence-flow.html">処理フロー</a>
+      </nav>
+    </aside>
+    <div class="content">
+      <article>
+        <p class="page-eyebrow">概観 / Overview</p>
+        <h1>システム概要</h1>
+        <p class="lead">
+          ローカルの Ollama (gpt-oss) 上で動作する、オーケストレータ + プランナー / エグゼキューター(並列) / エヴァリュエーター 構成の AI エージェント。
+          各エージェントの稼働状況と思考内容を、フロントエンドのチャット画面へ Server-Sent Events (SSE) でリアルタイム表示する。
+        </p>
+
+        <h2 id="what">1. このシステムは何か</h2>
+        <p>
+          本システムは、ユーザーの要求を 1 つの大規模言語モデル呼び出しで処理するのではなく、
+          役割の異なる複数のエージェントを <strong>LangGraph</strong> のグラフ上で連携させて解く
+          オーケストレータ型 (orchestrator-worker) の AI エージェントである。
+          言語モデルはクラウド API ではなく、ローカルで起動した <strong>Ollama</strong> の <code>gpt-oss:20b</code> を用いる。
+        </p>
+        <p>処理は次の親グラフ(オーケストレータ)で流れる。</p>
+        <div class="diagram"><pre>
+  ユーザー
+    │  (React + SSE)
+    ▼
+  FastAPI  /chat/stream
+    │
+    ▼  LangGraph 親グラフ (オーケストレータ)
+  START → recall_memory ─→ planner ─┬─[Send 並列]→ executor(t1)
+                                    ├──────────────→ executor(t2)   ← 並列実行
+                                    └──────────────→ executor(t3)
+                                           │ (fan-in)
+                                           ▼
+                                       evaluator ──┬─ 合格/上限 → finalize → END
+                                                   └─ 不合格      → planner(再計画)
+         │
+         ▼ 背景で記憶化 (LangMem)
+    PostgreSQL + pgvector + nomic-embed-text(768次元)
+        </pre></div>
+        <ul>
+          <li><strong>recall_memory</strong>: 長期記憶 (LangMem) から関連する記憶を呼び戻す。</li>
+          <li><strong>planner</strong>: 要求をタスクへ分解する。</li>
+          <li><strong>executor</strong>: 分解されたタスクを Send API で並列ファンアウトして実行する。</li>
+          <li><strong>evaluator</strong>: 結果を評価し、不合格なら planner へ再計画として戻す(<code>MAX_ITERATIONS</code> 上限あり)。</li>
+          <li><strong>finalize</strong>: 最終回答を確定する。背景で会話を記憶化する。</li>
+        </ul>
+
+        <h2 id="problem">2. 解決する課題と特徴</h2>
+        <div class="grid">
+          <div class="card">
+            <h3>コンテキストの肥大化</h3>
+            <p>
+              各エージェント(Planner / Executor / Evaluator)は独立してコンパイルされた StateGraph で、
+              親グラフと State キーを共有しない。会話履歴を引き継がず、毎回まっさらなコンテキストで起動するため、
+              プロンプトの肥大化を抑える。
+            </p>
+          </div>
+          <div class="card">
+            <h3>逐次処理による遅延</h3>
+            <p>
+              Planner が出力した複数タスクを、オーケストレータが <strong>Send API</strong> で並列ファンアウトする。
+              複数 Executor の結果は <code>Annotated[list, operator.add]</code> のリデューサで安全にマージする。
+            </p>
+          </div>
+          <div class="card">
+            <h3>エージェントの不透明さ</h3>
+            <p>
+              各ノードが <code>get_stream_writer()</code> で status / thinking / plan / task_update / token / evaluation を発行し、
+              SSE 経由でフロントの「稼働パネル」とチャットを同時更新。今どのエージェントが何を考えているかを可視化する。
+            </p>
+          </div>
+          <div class="card">
+            <h3>セッションを跨いだ記憶</h3>
+            <p>
+              会話を LangMem で記憶化し、PostgreSQL + pgvector に永続化する。
+              プロセス再起動後も記憶が残り、<code>recall_memory</code> で意味検索により呼び戻せる。
+            </p>
+          </div>
+        </div>
+
+        <h2 id="stack">3. 技術スタック</h2>
+        <p>各レイヤーの主要な実依存(<code>backend/pyproject.toml</code> / <code>frontend/package.json</code>)を以下に示す。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>レイヤー</th><th>技術 / ライブラリ</th><th>バージョン制約</th><th>役割</th></tr>
+            </thead>
+            <tbody>
+              <tr><td rowspan="9">バックエンド (Python)</td><td>Python</td><td>&gt;=3.11</td><td>実行ランタイム</td></tr>
+              <tr><td>FastAPI</td><td>&gt;=0.115</td><td>Web / API フレームワーク</td></tr>
+              <tr><td>uvicorn[standard]</td><td>&gt;=0.30</td><td>ASGI サーバ</td></tr>
+              <tr><td>sse-starlette</td><td>&gt;=2.1</td><td>Server-Sent Events 配信</td></tr>
+              <tr><td>langgraph</td><td>&gt;=0.2</td><td>エージェントのグラフ・オーケストレーション</td></tr>
+              <tr><td>langchain-core / langchain-ollama</td><td>&gt;=0.3</td><td>LLM 抽象 / Ollama 連携</td></tr>
+              <tr><td>langmem</td><td>&gt;=0.0.20</td><td>長期記憶(記憶化・呼び戻し)</td></tr>
+              <tr><td>langgraph-checkpoint-postgres</td><td>&gt;=2.0</td><td>PostgreSQL バックエンドのストア</td></tr>
+              <tr><td>psycopg[binary,pool]</td><td>&gt;=3.2</td><td>PostgreSQL ドライバ / コネクションプール</td></tr>
+              <tr><td rowspan="2">設定 / バリデーション</td><td>pydantic</td><td>&gt;=2.7</td><td>データモデル</td></tr>
+              <tr><td>pydantic-settings</td><td>&gt;=2.3</td><td>環境変数 / .env 読み込み</td></tr>
+              <tr><td rowspan="5">フロントエンド</td><td>React / react-dom</td><td>^19.0.0</td><td>UI フレームワーク</td></tr>
+              <tr><td>Vite</td><td>^6.0.0</td><td>ビルド / dev サーバ</td></tr>
+              <tr><td>TypeScript</td><td>^5.6.0</td><td>型付き言語</td></tr>
+              <tr><td>@vitejs/plugin-react</td><td>^4.3.4</td><td>React 用 Vite プラグイン</td></tr>
+              <tr><td>@microsoft/fetch-event-source</td><td>^2.0.1</td><td>SSE クライアント受信</td></tr>
+              <tr><td rowspan="2">データベース / モデル</td><td>pgvector/pgvector:pg16</td><td>(Docker イメージ)</td><td>PostgreSQL 16 + pgvector 拡張</td></tr>
+              <tr><td>nomic-embed-text</td><td>768 次元</td><td>埋め込みモデル(意味検索)</td></tr>
+              <tr><td>LLM</td><td>gpt-oss (Ollama)</td><td>gpt-oss:20b</td><td>言語モデル(ローカル実行)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="philosophy">4. 主要な設計思想</h2>
+        <div class="callout note">
+          <span class="label">コンテキスト分離</span>
+          各エージェントは独立コンパイルされた StateGraph として動き、親グラフと State キーを一切共有しない。
+          オーケストレータはブリッジノードから明示的な指示文だけを渡し、戻り値の必要なキーだけを読み戻す。
+          会話履歴は引き継がれず、各エージェントは毎回まっさらなコンテキストで起動する。
+        </div>
+        <div class="callout tip">
+          <span class="label">並列ファンアウト</span>
+          Planner が出力したタスクを Send API で並列に Executor へ展開し、結果は
+          <code>Annotated[list, operator.add]</code> のリデューサで安全にマージする。
+        </div>
+        <div class="callout note">
+          <span class="label">リアルタイムストリーミング</span>
+          FastAPI が <code>astream(stream_mode=["custom","updates"], subgraphs=True)</code> を SSE に変換し、
+          React の <code>useAgentStream</code> フックがチャットと稼働パネルを同時更新する。
+          gpt-oss の思考 (reasoning) は <code>reasoning_content</code> に分離され、思考ログに流れる。
+        </div>
+        <div class="callout warn">
+          <span class="label">既知の制約</span>
+          DB が未起動だと記憶検索 / 保存はスキップされる(チャット自体は動作)。
+          単一 Ollama インスタンスへの並列 Executor は <code>OLLAMA_NUM_PARALLEL</code> 次第でモデルサーバ側で直列化されうる。
+          gpt-oss の structured output は不安定なため、Planner / Evaluator は寛容な JSON 抽出 + フォールバックで対処する。
+        </div>
+
+        <h2 id="config">5. 環境変数設定</h2>
+        <p>
+          設定は <code>backend/app/config.py</code>(pydantic-settings の <code>Settings</code>)で定義し、
+          <code>backend/.env</code> / 環境変数から読み込む。既定値と説明は次のとおり。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>変数</th><th>既定値</th><th>説明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>OLLAMA_BASE_URL</code></td><td><code>http://localhost:11434</code></td><td>Ollama サーバのエンドポイント</td></tr>
+              <tr><td><code>CHAT_MODEL</code></td><td><code>gpt-oss:20b</code></td><td>言語モデル</td></tr>
+              <tr><td><code>EMBED_MODEL</code></td><td><code>nomic-embed-text</code></td><td>埋め込みモデル(768次元固定)</td></tr>
+              <tr><td><code>REASONING_EFFORT</code></td><td><code>medium</code></td><td>gpt-oss の思考レベル(low / medium / high)</td></tr>
+              <tr><td><code>NUM_CTX</code></td><td><code>8192</code></td><td>コンテキスト長(明示必須。未指定だと Ollama が切り詰める)</td></tr>
+              <tr><td><code>MAX_ITERATIONS</code></td><td><code>2</code></td><td>評価 → 再計画ループの最大反復回数</td></tr>
+              <tr><td><code>EMBED_DIMS</code></td><td><code>768</code></td><td>nomic-embed-text の埋め込み次元(必須・固定)</td></tr>
+              <tr><td><code>FRONTEND_ORIGIN</code></td><td><code>http://localhost:5173</code></td><td>CORS で許可する Vite dev サーバのオリジン</td></tr>
+              <tr><td><code>DATABASE_URL</code></td><td><code>postgresql://agent:agent@localhost:5432/agent</code></td><td>長期記憶を永続化する PostgreSQL(pgvector)接続文字列</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <span class="pill blue">CHAT_MODEL</span>
+          <span class="pill purple">EMBED_MODEL</span>
+          <span class="pill green">REASONING_EFFORT</span>
+          <span class="pill blue">NUM_CTX</span>
+          <span class="pill purple">MAX_ITERATIONS</span>
+          <span class="pill green">DATABASE_URL</span>
+        </p>
+
+        <footer class="doc-footer">
+          <div>LangGraph オーケストレータ エージェント — 設計書</div>
+          <div class="nav-links"><a href="index.html">&larr; 目次</a><a href="architecture.html">アーキテクチャ &rarr;</a></div>
+        </footer>
+      </article>
+    </div>
+  </div>
+</body>
+</html>

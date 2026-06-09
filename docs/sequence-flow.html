@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>処理フロー — LangGraph オーケストレータ 設計書</title>
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">LangGraph オーケストレータ
+        <span class="sub">設計書 / Design Docs</span>
+      </a>
+      <nav>
+        <div class="group-title">概観</div>
+        <a href="overview.html">システム概要</a>
+        <a href="architecture.html">アーキテクチャ</a>
+        <div class="group-title">詳細設計</div>
+        <a href="backend-design.html">バックエンド設計</a>
+        <a href="frontend-design.html">フロントエンド設計</a>
+        <a href="memory-design.html">長期記憶設計</a>
+        <div class="group-title">インタフェース</div>
+        <a href="api-spec.html">API / SSE 仕様</a>
+        <a href="sequence-flow.html" class="active">処理フロー</a>
+      </nav>
+    </aside>
+    <div class="content">
+      <article>
+        <p class="page-eyebrow">処理フロー / シーケンス</p>
+        <h1>処理フロー</h1>
+        <p class="lead">1リクエストがブラウザから FastAPI を経てオーケストレータ(親グラフ)に入り、記憶想起 → 計画 → 並列実行 → 評価 → (再計画ループ) → 最終回答生成 → 記憶化、と流れる過程を、<code>orchestrator.py</code> の制御フローと各段で発火する SSE イベントに沿って追跡する。</p>
+
+        <h2>エンドツーエンド シーケンス</h2>
+        <p>1リクエストの全体像を縦方向に示す。親グラフは <code>recall_memory → planner → executor×N(並列) → evaluator → finalize</code> をエッジで結び、評価結果に応じて <code>planner</code> へ戻る再計画ループを持つ。各ノードは <code>writer()</code> でカスタムイベントを発行し、<code>service.py</code> がそれを SSE として中継する。</p>
+
+        <div class="card">
+        <div class="diagram"><pre>
+ User        React(useAgentStream)     FastAPI        Orchestrator(親グラフ)            Sub-agents
+  |                  |                    |                  |                              |
+  |  入力送信         |                    |                  |                              |
+  |----------------->| POST /chat/stream  |                  |                              |
+  |                  |------------------->| run_agent_stream |                              |
+  |                  |   (SSE 接続開始)    |----------------->| orchestrator.astream         |
+  |                  |                    |   status:        |  (custom + updates,          |
+  |                  |  &lt;== "エージェント起動" =====           |   subgraphs=True)            |
+  |                  |                    |                  |                              |
+  |                  |                    |                  | [recall_memory]              |
+  |                  |  &lt;== status(memory running) ===========|  recall_memories(uid,req)    |
+  |                  |  &lt;== memory(items) ====================|  (取得できた場合のみ)         |
+  |                  |  &lt;== status(memory node_complete) =====|  → iteration=0               |
+  |                  |                    |                  |                              |
+  |                  |                    |                  | [planner_node] ----------->  | planner_agent
+  |                  |  &lt;== status(planner running) ==========|                              |  _plan()
+  |                  |  &lt;== thinking(planner) ================|     (reasoning 差分)         |
+  |                  |  &lt;== plan(tasks[]) ====================|                              |
+  |                  |  &lt;== status(planner node_complete) ====| &lt;--- {plan:[...]} -----------|
+  |                  |                    |                  |                              |
+  |                  |                    |                  | [assign_executors]           |
+  |                  |  &lt;== status(orchestrator: N件振り分け) =|  → Send("executor", ...) ×N  |
+  |                  |                    |                  |    +----------+----------+    |
+  |                  |                    |                  |    v          v          v    | executor_agent
+  |                  |  &lt;== task_update(running) =============| executor  executor  executor |  ×N 並列
+  |                  |  &lt;== token(executor, task_id) =========|  (本文トークン逐次)          |  _execute()
+  |                  |  &lt;== task_update(done) ================|    +----------+----------+    |
+  |                  |                    |                  |    fan-in (operator.add)     |
+  |                  |                    |                  |  → task_results をマージ     |
+  |                  |                    |                  |                              |
+  |                  |                    |                  | [evaluator_node] --------->  | evaluator_agent
+  |                  |  &lt;== status(evaluator running) ========|                              |  _evaluate()
+  |                  |  &lt;== evaluation(passed,feedback) ======|  → iteration += 1            |
+  |                  |  &lt;== status(evaluator node_complete) ==| &lt;--- {evaluation} -----------|
+  |                  |                    |                  |                              |
+  |                  |                    |                  | [route_after_eval]           |
+  |                  |                    |                  |  passed もしくは             |
+  |                  |                    |                  |  iteration &gt;= MAX → finalize |
+  |                  |                    |                  |  それ以外 → planner(再計画)  |
+  |                  |                    |                  |       ^___________|           |
+  |                  |                    |                  |                              |
+  |                  |                    |                  | [finalize]                   |
+  |                  |  &lt;== status(finalize running) =========|  stream_agent(統合)          |
+  |                  |  &lt;== token(finalize) ==================|   (最終回答トークン逐次)     |
+  |                  |  &lt;== final(answer) ====================|  remember_async(背景記憶化)  |
+  |                  |  &lt;== status(finalize node_complete) ===| &lt;--- {final_answer} ---------|
+  |                  |                    |                  |                              |
+  |                  |  &lt;== final "[DONE]" (終端センチネル) ===| (astream 完了後)             |
+  |  回答表示         | finish: answer 確定 |                  |                              |
+  |&lt;-----------------|                    |                  |                              |
+</pre></div>
+        </div>
+
+        <div class="callout note"><span class="label">補足</span> <code>service.py</code> は <code>stream_mode=["custom","updates"]</code> かつ <code>subgraphs=True</code> で <code>astream</code> を消費する。サブエージェント内部の <code>writer()</code> イベントも親ストリームへ浮上するため、planner/executor/evaluator の <code>thinking</code> や <code>token</code> がそのままフロントへ届く。</p></div>
+
+        <h2>処理ステップ(時系列)</h2>
+        <p><code>orchestrator.py</code> のノード遷移と <code>service.py</code> の中継処理を時系列に列挙する。</p>
+        <div class="steps">
+        <ol>
+          <li>フロントの <code>send()</code> が <code>POST /chat/stream</code> を発行し、<code>fetchEventSource</code> で SSE 接続を開く(<code>openWhenHidden:true</code>)。reducer は <code>start</code> で状態を初期化しユーザーメッセージを追加する。</li>
+          <li><code>run_agent_stream()</code> が即座に <code>status</code>(node=orchestrator, state=running, "エージェント起動")を送出し、<code>orchestrator.astream(inputs, stream_mode=["custom","updates"], subgraphs=True)</code> を開始する。inputs は <code>user_request</code> と <code>user_id</code>。</li>
+          <li><strong>recall_memory</strong>: <code>recall_memories(user_id, user_request)</code> で長期記憶を想起。1件以上あれば <code>memory</code> イベントを発行し、<code>retrieved_memories</code> と <code>iteration=0</code> を親 State へ書き戻す。</li>
+          <li><strong>planner_node</strong>: 要求・記憶・前回フィードバックのみを <code>planner_agent.ainvoke</code> に渡す。サブグラフ内で LLM をストリームし <code>thinking</code> を流し、<code>plan</code> イベント(tasks 配列)を発行。戻り値の <code>plan</code> を親 State へ書き戻す(JSON 解析に失敗した場合は要求そのものを1タスクにフォールバック)。</li>
+          <li><strong>assign_executors</strong>(条件エッジ): <code>plan</code> の各タスクを <code>Send("executor", {instruction, task_id})</code> に変換してリスト返却し、N 個の executor を並列ファンアウトする。直前に <code>status</code>(node=orchestrator, "N件のタスクを並列実行へ振り分け")を送出。</li>
+          <li><strong>executor_node ×N</strong>(並列): 各 executor は割り当てられた単一 <code>instruction</code> / <code>task_id</code> のみで実行。<code>task_update</code>(running)→ 本文 <code>token</code> 逐次 → <code>task_update</code>(done)を発行し、<code>task_results</code> を <code>operator.add</code> リデューサ経由で1要素ずつ返す。</li>
+          <li><strong>evaluator_node</strong>(fan-in バリア): 全 executor 完了後に1回だけ起動。要求と <code>task_results</code> を <code>evaluator_agent</code> に渡し、<code>evaluation</code>(passed/feedback)イベントを発行。親 State に <code>evaluation</code> を書き戻し、<code>iteration</code> を +1 する。</li>
+          <li><strong>route_after_eval</strong>(条件エッジ): <code>passed</code> が真、または <code>iteration &gt;= max_iterations</code> なら <code>finalize</code> へ。そうでなければ <code>replan</code> として <code>planner</code> へ戻る。</li>
+          <li><strong>finalize</strong>: <code>status</code>(finalize running)を送出し、全タスク結果を結合したプロンプトで統合 LLM をストリーム実行(<code>emit_tokens=True</code> で <code>token</code> を逐次)。<code>final</code>(answer)イベントを発行後、<code>remember_async(user_id, user_request, answer)</code> で背景記憶化(ホットパスをブロックしない)。<code>final_answer</code> を返す。</li>
+          <li><strong>終端</strong>: <code>astream</code> 完了後、<code>service.py</code> が <code>final "[DONE]"</code> センチネルを送出。フロントは <code>msg.data === "[DONE]"</code> を検知して <code>finish</code> をディスパッチし、ストリーミング中の <code>answer</code> を確定メッセージへコミットして接続を <code>abort</code> する。</li>
+        </ol>
+        </div>
+
+        <h2>並列ファンアウトの詳細フロー</h2>
+        <p>並列実行は LangGraph の <code>Send</code> と <code>operator.add</code> リデューサで実現している。<code>planner</code> の出力 <code>plan</code> の各タスクが個別の <code>executor</code> 起動へ展開され、全完了後に <code>task_results</code> がマージされてから <code>evaluator</code> へ進む。</p>
+
+        <div class="card">
+        <div class="diagram"><pre>
+   [planner_node]
+        |  plan = [t1, t2, t3, ...]
+        v
+   add_conditional_edges("planner", assign_executors, ["executor"])
+        |
+        |  assign_executors(): plan の各 task を
+        |  Send("executor", {instruction, task_id}) に変換しリスト返却
+        v
+   +---------------+   +---------------+   +---------------+
+   | executor (t1) |   | executor (t2) |   | executor (t3) |   ← 並列起動
+   |  instruction  |   |  instruction  |   |  instruction  |
+   |  task_id 専任 |   |  task_id 専任 |   |  task_id 専任 |
+   | return        |   | return        |   | return        |
+   | task_results: |   | task_results: |   | task_results: |
+   |   [{t1,...}]  |   |   [{t2,...}]  |   |   [{t3,...}]  |
+   +-------+-------+   +-------+-------+   +-------+-------+
+           \                  |                  /
+            \                 |                 /
+             v                v                v
+        fan-in: ParentState.task_results は operator.add リデューサ
+                各 executor の 1 要素リストを連結して安全にマージ
+                       |
+                       v   add_edge("executor","evaluator") = fan-in バリア
+                  [evaluator_node]   ← 全 executor 完了後に 1 回だけ実行
+</pre></div>
+        </div>
+
+        <div class="grid">
+          <div class="card">
+            <h3>Send によるファンアウト</h3>
+            <p><code>assign_executors</code> は通常のルータ関数ではなく <code>Send</code> オブジェクトのリストを返す。各 <code>Send</code> は executor ノードを独立に起動し、ペイロード <code>{instruction, task_id}</code> をその実行専用 State として注入する。executor は <code>instruction</code> 1件のみを知り、他タスクや会話履歴を持たない(コンテキスト分離)。</p>
+          </div>
+          <div class="card">
+            <h3>operator.add による fan-in</h3>
+            <p>各 executor は <code>task_results</code> を1要素リストで返す。<code>ParentState.task_results</code> に <code>operator.add</code> リデューサが付与されているため、並列戻り値が衝突せずリスト連結でマージされる。<code>add_edge("executor","evaluator")</code> が fan-in バリアとなり、全 executor 完了後に evaluator が1回だけ起動する。</p>
+          </div>
+        </div>
+
+        <h2>評価 → 再計画ループの分岐</h2>
+        <p>評価後の分岐は <code>route_after_eval(state)</code> が担う。条件は <code>evaluation.passed</code> と累積 <code>iteration</code>(evaluator 通過ごとに +1)で決まる。<code>max_iterations</code> は <code>settings.max_iterations</code>。</p>
+
+        <div class="card">
+        <div class="diagram"><pre>
+                       [evaluator_node]
+                  evaluation = {passed, feedback}
+                  iteration += 1
+                            |
+                            v
+                   route_after_eval(state)
+                            |
+        +-------------------+--------------------+
+        |                                        |
+  passed == True              passed == False かつ
+   (合格)                       iteration &lt; max_iterations
+        |                       (不合格 / 上限未到達)
+        |                                        |
+        |          iteration &gt;= max_iterations   |
+        |           (上限到達 / 打ち切り)         |
+        |                |                       |
+        v                v                       v
+   "finalize"       "finalize"               "replan"
+        |                |                       |
+        +-------+--------+                       v
+                v                          [planner_node]
+           [finalize]                feedback を反映して再計画
+        最終回答を生成・記憶化         → 再び executor×N → evaluator
+</pre></div>
+        </div>
+
+        <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>分岐</th><th>条件</th><th>遷移先</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><span class="pill green">合格</span></td><td><code>evaluation.passed</code> が真</td><td><code>finalize</code></td></tr>
+            <tr><td><span class="pill warn">上限到達</span></td><td><code>iteration &gt;= settings.max_iterations</code>(passed が偽でも打ち切り)</td><td><code>finalize</code></td></tr>
+            <tr><td><span class="pill purple">不合格</span></td><td>上記いずれにも該当しない(passed が偽 かつ 上限未到達)</td><td><code>replan</code> → <code>planner</code></td></tr>
+          </tbody>
+        </table>
+        </div>
+        <div class="callout tip"><span class="label">再計画時の伝搬</span> <code>planner_node</code> は再入時に <code>state["evaluation"]["feedback"]</code> を取り出して <code>planner_agent</code> へ渡す。planner サブグラフは feedback がある場合「前回の計画は不十分でした。次の指摘を反映して再計画してください」とプロンプトへ追記し、計画を作り直す。</p></div>
+
+        <h2>SSE イベントとフロント状態更新の対応</h2>
+        <p>各ノードが発行するイベント type と、<code>useAgentStream.ts</code> の <code>applyEvent</code> による <code>ChatState</code> 更新の対応を示す。</p>
+
+        <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>発火元ノード</th><th>SSE event type</th><th>主なフィールド</th><th>フロントの状態更新(applyEvent)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>run_agent_stream / 各ノード</td><td><code>status</code></td><td>node, state, message</td><td>state=running のとき <code>currentNode</code> 更新、<code>statusMessage</code> 更新</td></tr>
+            <tr><td>recall_memory</td><td><code>memory</code></td><td>items</td><td><code>memories</code> を items で置換</td></tr>
+            <tr><td>planner</td><td><code>thinking</code></td><td>agent, task_id, content</td><td>同一 agent/task の連続思考を末尾追記でまとめ <code>thoughts</code> 更新</td></tr>
+            <tr><td>planner</td><td><code>plan</code></td><td>tasks[]</td><td><code>tasks</code> を生成(status=pending, parallelGroup 付与)</td></tr>
+            <tr><td>executor(並列)</td><td><code>task_update</code></td><td>task_id, status, label</td><td>該当 <code>tasks[].status</code> / label を更新(running→done)</td></tr>
+            <tr><td>executor / finalize</td><td><code>token</code></td><td>agent, task_id, content</td><td><code>answer</code> に content を追記(finalize 本文の逐次表示)</td></tr>
+            <tr><td>evaluator</td><td><code>evaluation</code></td><td>passed, feedback</td><td><code>evaluation</code> を {passed, feedback} で更新</td></tr>
+            <tr><td>finalize</td><td><code>final</code></td><td>answer</td><td><code>answer</code> を answer で確定(空なら既存維持)</td></tr>
+            <tr><td>service(例外時)</td><td><code>error</code></td><td>message</td><td><code>statusMessage</code> に「エラー: …」を設定</td></tr>
+            <tr><td>service(終端)</td><td><code>final</code> = "[DONE]"</td><td>—</td><td>onmessage が <code>finish</code> をディスパッチ。<code>answer</code> を assistant メッセージへコミットし <code>running=false</code></td></tr>
+          </tbody>
+        </table>
+        </div>
+
+        <div class="callout warn"><span class="label">注意</span> <code>thinking</code> と <code>token</code> はサブエージェント由来でも <code>subgraphs=True</code> により親ストリームへ浮上する。<code>token</code> はフロントでは agent を問わず <code>answer</code> へ追記されるため、本文トークンを発行するのは <code>emit_tokens=True</code> を指定する executor と finalize に限られる(planner/evaluator は <code>emit_tokens</code> 未指定で <code>token</code> を流さない)。</p></div>
+
+        <footer class="doc-footer">
+          <div>LangGraph オーケストレータ エージェント — 設計書</div>
+          <div class="nav-links"><a href="api-spec.html">&larr; API / SSE 仕様</a></div>
+        </footer>
+      </article>
+    </div>
+  </div>
+</body>
+</html>

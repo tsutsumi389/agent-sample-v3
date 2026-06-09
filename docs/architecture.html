@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>アーキテクチャ — LangGraph オーケストレータ 設計書</title>
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">LangGraph オーケストレータ
+        <span class="sub">設計書 / Design Docs</span>
+      </a>
+      <nav>
+        <div class="group-title">概観</div>
+        <a href="overview.html">システム概要</a>
+        <a href="architecture.html" class="active">アーキテクチャ</a>
+        <div class="group-title">詳細設計</div>
+        <a href="backend-design.html">バックエンド設計</a>
+        <a href="frontend-design.html">フロントエンド設計</a>
+        <a href="memory-design.html">長期記憶設計</a>
+        <div class="group-title">インタフェース</div>
+        <a href="api-spec.html">API / SSE 仕様</a>
+        <a href="sequence-flow.html">処理フロー</a>
+      </nav>
+    </aside>
+    <div class="content">
+      <article>
+        <p class="page-eyebrow">アーキテクチャ</p>
+        <h1>アーキテクチャ設計</h1>
+        <p class="lead">本システムは <strong>オーケストレータ + プランナー / エグゼキューター(並列) / エヴァリュエーター</strong> 構成の AI エージェントである。LangGraph の親グラフが全体を制御し、各エージェントは独立コンパイルされた StateGraph として動作する。本章では全体構成、親グラフのノード/エッジ、コンテキスト分離、並列実行、State スキーマを示す。</p>
+
+        <h2>1. 全体構成</h2>
+        <p>ユーザーの入力は React フロントから SSE 経由で FastAPI に届き、LangGraph 親グラフ(オーケストレータ)が処理を統括する。Planner が計画を立て、Executor が並列実行され、Evaluator が結果を評価する。最終回答生成時には背景で会話を記憶化し、PostgreSQL(pgvector)へ永続化する。</p>
+        <div class="diagram"><pre>
+  ┌────────┐
+  │ ユーザー │
+  └───┬────┘
+      │ React + SSE
+      ▼
+  ┌─────────────────────────────┐
+  │ FastAPI   /chat/stream      │
+  └───┬─────────────────────────┘
+      │ astream(stream_mode=["custom","updates"], subgraphs=True)
+      ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ LangGraph 親グラフ (オーケストレータ)                       │
+  │                                                            │
+  │  recall_memory → planner ─┬─[Send]→ executor(t1) ┐         │
+  │                           ├─[Send]→ executor(t2) │ 並列     │
+  │                           └─[Send]→ executor(t3) ┘         │
+  │                                       │ fan-in             │
+  │                                       ▼                    │
+  │                                  evaluator                 │
+  │                                  ┌──┴──┐                   │
+  │                          合格/上限    不合格                 │
+  │                            │            │                  │
+  │                            ▼            ▼                  │
+  │                        finalize    planner(再計画)          │
+  └────────────────────────────┬───────────────────────────────┘
+                               │ remember_async(背景で記憶化 / LangMem)
+                               ▼
+                ┌───────────────────────────────────────┐
+                │ PostgreSQL + pgvector                  │
+                │ nomic-embed-text (768次元)             │
+                └───────────────────────────────────────┘
+        </pre></div>
+        <div class="callout note"><span class="label">NOTE</span> 記憶化 (<code>remember_async</code>) は <code>finalize</code> ノードの中でホットパスをブロックせずに背景実行される。DB が未起動の場合は記憶検索/保存がスキップされ、チャット自体は動作する。</div>
+
+        <h2>2. LangGraph 親グラフ — ノードとエッジ</h2>
+        <p><code>backend/app/orchestrator.py</code> の <code>build_orchestrator()</code> が親グラフを構築する。<code>StateGraph(ParentState)</code> に 5 つのノードを登録し、条件エッジで Send による並列ファンアウトと評価後ルーティングを実現している。</p>
+        <div class="diagram"><pre>
+   START
+     │
+     ▼
+  recall_memory          記憶を想起 (retrieved_memories, iteration=0)
+     │  add_edge
+     ▼
+  planner                計画を生成 (plan)
+     │  add_conditional_edges(assign_executors, ["executor"])
+     │  ── plan の各タスクを Send で並列ファンアウト ──
+     ▼ ▼ ▼
+  executor × N           各タスクを実行 (task_results を operator.add でマージ)
+     │  add_edge  (fan-in バリア: 全 executor 完了後に評価へ)
+     ▼
+  evaluator              結果を評価 (evaluation, iteration+1)
+     │  add_conditional_edges(route_after_eval, {replan, finalize})
+     ├─ replan ───────────► planner   (不合格 かつ iteration &lt; MAX_ITERATIONS)
+     │
+     └─ finalize          (passed=True または iteration &gt;= MAX_ITERATIONS)
+            │  add_edge
+            ▼
+           END
+        </pre></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ノード名</th><th>関数</th><th>役割</th><th>主な書き戻しキー</th></tr></thead>
+            <tbody>
+              <tr><td><span class="pill blue">recall_memory</span></td><td><code>recall_memory</code></td><td>長期記憶を想起</td><td><code>retrieved_memories</code>, <code>iteration</code></td></tr>
+              <tr><td><span class="pill purple">planner</span></td><td><code>planner_node</code></td><td>Planner サブグラフを呼ぶブリッジ</td><td><code>plan</code></td></tr>
+              <tr><td><span class="pill green">executor</span></td><td><code>executor_node</code></td><td>Executor サブグラフを呼ぶブリッジ(並列起動)</td><td><code>task_results</code></td></tr>
+              <tr><td><span class="pill purple">evaluator</span></td><td><code>evaluator_node</code></td><td>Evaluator サブグラフを呼ぶブリッジ</td><td><code>evaluation</code>, <code>iteration</code></td></tr>
+              <tr><td><span class="pill blue">finalize</span></td><td><code>finalize</code></td><td>結果を統合し最終回答を生成、背景で記憶化</td><td><code>final_answer</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>分岐は 2 つの関数が担う。<code>assign_executors(state)</code> は <code>plan</code> の各タスクから <code>Send("executor", ...)</code> のリストを返し、<code>route_after_eval(state)</code> は <code>evaluation["passed"]</code> または <code>iteration &gt;= settings.max_iterations</code> なら <code>"finalize"</code>、そうでなければ <code>"replan"</code>(= planner へ戻る)を返す。</p>
+
+        <h2>3. コンテキスト分離</h2>
+        <p>各サブエージェント(Planner / Executor / Evaluator)は <strong>独立してコンパイルされた StateGraph</strong> であり、親グラフと State キーを一切共有しない。オーケストレータの各ブリッジノードは、サブエージェントへ <strong>明示的な指示文だけ</strong> を渡し、戻り値の必要なキーだけを親 State に読み戻す。</p>
+        <div class="callout note"><span class="label">NOTE</span> State キーを共有すると暗黙の共有チャネルとなり分離が壊れる(<code>schemas.py</code> 冒頭の設計意図)。そのため <code>ParentState</code> と各サブエージェントの State は意図的にキーを分けている。会話履歴は引き継がれず、各エージェントは毎回まっさらなコンテキストで起動する。</div>
+        <p>具体的にブリッジノードが渡す内容は以下の通り。</p>
+        <ul>
+          <li><code>planner_node</code> → Planner には <code>request</code> / <code>memories</code> / <code>feedback</code> のみ渡す(<code>feedback</code> は前回評価の <code>evaluation.feedback</code>)。</li>
+          <li><code>executor_node</code> → Executor には <code>instruction</code> / <code>task_id</code> のみ渡す(Send のペイロード由来)。</li>
+          <li><code>evaluator_node</code> → Evaluator には <code>request</code> / <code>results</code> のみ渡す。</li>
+        </ul>
+
+        <h2>4. 並列実行</h2>
+        <p>Planner が出力したタスク(<code>plan</code>)を、オーケストレータが <strong>Send API</strong> で並列ファンアウトする。<code>add_conditional_edges("planner", assign_executors, ["executor"])</code> により、planner ノードの後で <code>assign_executors</code> が <code>Send</code> のリストを返し、各タスクが個別の <code>executor</code> 起動になる。</p>
+        <pre><code>def assign_executors(state: ParentState):
+    """plan の各タスクを並列 Executor として Send でファンアウトする。"""
+    plan = state.get("plan") or []
+    writer = safe_writer()
+    writer({"type": "status", "node": "orchestrator", "state": "running",
+            "message": f"{len(plan)}件のタスクを並列実行へ振り分け"})
+    return [
+        Send("executor", {"instruction": t["instruction"], "task_id": t["id"]})
+        for t in plan
+    ]</code></pre>
+        <p>複数の <code>executor</code> が並列に書き込む結果は、State 側のリデューサで安全にマージされる。<code>ParentState.task_results</code> に <code>Annotated[list[TaskResult], operator.add]</code> を付けることで、並列書き込みが結合される(リデューサが無いと <code>InvalidUpdateError</code> になる)。</p>
+        <pre><code>class ParentState(TypedDict, total=False):
+    ...
+    task_results: Annotated[list[TaskResult], operator.add]  # 並列マージ
+    ...</code></pre>
+        <p><code>executor</code> → <code>evaluator</code> の通常エッジは fan-in バリアとして機能し、全 executor が完了してから evaluator が起動する。</p>
+        <div class="callout warn"><span class="label">制約</span> 単一 Ollama インスタンスへの並列 Executor は、<code>OLLAMA_NUM_PARALLEL</code> 次第でモデルサーバ側で直列化されうる(README「既知の制約」)。</div>
+
+        <h2>5. State / スキーマ構造</h2>
+        <p><code>backend/app/schemas.py</code> はドメイン型、親グラフ State、各サブエージェントの独立 State を定義する。すべて <code>TypedDict</code> で表現される。</p>
+        <h3>5.1 ドメイン型</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>型</th><th>フィールド</th><th>説明</th></tr></thead>
+            <tbody>
+              <tr><td><code>Task</code></td><td><code>id: str</code>, <code>instruction: str</code>, <code>parallel_group: int</code></td><td>Planner が生成するタスク</td></tr>
+              <tr><td><code>TaskResult</code></td><td><code>task_id: str</code>, <code>instruction: str</code>, <code>result: str</code></td><td>Executor の実行結果</td></tr>
+              <tr><td><code>Evaluation</code></td><td><code>passed: bool</code>, <code>feedback: str</code></td><td>Evaluator の評価結果</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>5.2 親グラフ State (<code>ParentState</code>)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>フィールド</th><th>型</th><th>説明</th></tr></thead>
+            <tbody>
+              <tr><td><code>user_request</code></td><td><code>str</code></td><td>ユーザーの元の要求</td></tr>
+              <tr><td><code>user_id</code></td><td><code>str</code></td><td>記憶の名前空間に使うユーザー識別子</td></tr>
+              <tr><td><code>retrieved_memories</code></td><td><code>list[str]</code></td><td>想起された長期記憶</td></tr>
+              <tr><td><code>plan</code></td><td><code>list[Task]</code></td><td>Planner が生成した計画</td></tr>
+              <tr><td><code>task_results</code></td><td><code>Annotated[list[TaskResult], operator.add]</code></td><td>並列 Executor の結果(リデューサでマージ)</td></tr>
+              <tr><td><code>evaluation</code></td><td><code>Evaluation</code></td><td>Evaluator の評価</td></tr>
+              <tr><td><code>iteration</code></td><td><code>int</code></td><td>評価→再計画ループの回数</td></tr>
+              <tr><td><code>final_answer</code></td><td><code>str</code></td><td>finalize が生成した最終回答</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>5.3 各サブエージェントの独立 State</h3>
+        <p>親とキーを共有しない、各エージェント専用の State。いずれも <code>TypedDict, total=False</code>。</p>
+        <div class="grid">
+          <div class="card">
+            <h3><span class="pill purple">PlannerState</span></h3>
+            <ul>
+              <li><code>request: str</code></li>
+              <li><code>memories: list[str]</code></li>
+              <li><code>feedback: str</code></li>
+              <li><code>plan: list[Task]</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3><span class="pill green">ExecutorState</span></h3>
+            <ul>
+              <li><code>instruction: str</code></li>
+              <li><code>task_id: str</code></li>
+              <li><code>result: str</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3><span class="pill purple">EvaluatorState</span></h3>
+            <ul>
+              <li><code>request: str</code></li>
+              <li><code>results: list[TaskResult]</code></li>
+              <li><code>evaluation: Evaluation</code></li>
+            </ul>
+          </div>
+        </div>
+        <p>補助関数 <code>empty_evaluation()</code> は <code>{"passed": True, "feedback": ""}</code> を返し、評価が取得できなかった場合のフォールバック(<code>evaluator_node</code> で使用)となる。</p>
+
+        <footer class="doc-footer">
+          <div>LangGraph オーケストレータ エージェント — 設計書</div>
+          <div class="nav-links"><a href="overview.html">&larr; システム概要</a><a href="backend-design.html">バックエンド設計 &rarr;</a></div>
+        </footer>
+      </article>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>設計書トップ — LangGraph オーケストレータ 設計書</title>
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">LangGraph オーケストレータ
+        <span class="sub">設計書 / Design Docs</span>
+      </a>
+      <nav>
+        <div class="group-title">概観</div>
+        <a href="overview.html">システム概要</a>
+        <a href="architecture.html">アーキテクチャ</a>
+        <div class="group-title">詳細設計</div>
+        <a href="backend-design.html">バックエンド設計</a>
+        <a href="frontend-design.html">フロントエンド設計</a>
+        <a href="memory-design.html">長期記憶設計</a>
+        <div class="group-title">インタフェース</div>
+        <a href="api-spec.html">API / SSE 仕様</a>
+        <a href="sequence-flow.html">処理フロー</a>
+      </nav>
+    </aside>
+    <div class="content">
+      <article>
+        <header class="hero">
+          <p class="page-eyebrow">DESIGN DOCS</p>
+          <h1>LangGraph オーケストレータ エージェント 設計書</h1>
+          <p class="lead">ローカル Ollama (gpt-oss) 上で動く、オーケストレータ + プランナー / エグゼキューター(並列) / エヴァリュエーター 構成の AI エージェント。各エージェントの稼働状況と思考をチャット画面でリアルタイムに可視化する。</p>
+        </header>
+
+        <p>このシステムは、LangGraph の親グラフ(オーケストレータ)が <strong>recall_memory → planner → executor(並列) → evaluator</strong> の流れを統括し、評価結果に応じて再計画ループを回す構成です。Planner が出力したタスクは <strong>Send API</strong> で複数 Executor に並列ファンアウトされ、結果はリデューサで安全にマージされます。各ノードが発行するイベントは FastAPI で SSE に変換され、React フロントの稼働パネルに「今どのエージェントが何を考えているか」をリアルタイム表示します。長期記憶は PostgreSQL + pgvector に永続化されます。</p>
+
+        <h2>章の一覧</h2>
+        <div class="toc-grid">
+          <a class="toc-card" href="overview.html">
+            <span class="num">01</span>
+            <h3>システム概要</h3>
+            <p>このシステムが何を解決するか、技術スタック、主要な設計思想、環境変数設定を読めます。</p>
+          </a>
+          <a class="toc-card" href="architecture.html">
+            <span class="num">02</span>
+            <h3>アーキテクチャ</h3>
+            <p>LangGraph 親グラフのノード/エッジ、コンテキスト分離、並列実行、State スキーマ構造を読めます。</p>
+          </a>
+          <a class="toc-card" href="backend-design.html">
+            <span class="num">03</span>
+            <h3>バックエンド設計</h3>
+            <p>モジュール構成、サブエージェント詳細、LLM ファクトリ、ストリーム変換、評価→再計画ループを読めます。</p>
+          </a>
+          <a class="toc-card" href="frontend-design.html">
+            <span class="num">04</span>
+            <h3>フロントエンド設計</h3>
+            <p>技術スタック、コンポーネント構成、useAgentStream フック、型定義、リアルタイム可視化 UX を読めます。</p>
+          </a>
+          <a class="toc-card" href="memory-design.html">
+            <span class="num">05</span>
+            <h3>長期記憶設計</h3>
+            <p>AsyncPostgresStore の接続・初期化、記憶の検索/保存、pgvector 検索、フォールバック、docker-compose を読めます。</p>
+          </a>
+          <a class="toc-card" href="api-spec.html">
+            <span class="num">06</span>
+            <h3>API / SSE 仕様</h3>
+            <p>エンドポイント一覧、リクエストボディ、SSE イベント仕様、利用例、CORS / ミドルウェア設定を読めます。</p>
+          </a>
+          <a class="toc-card" href="sequence-flow.html">
+            <span class="num">07</span>
+            <h3>処理フロー</h3>
+            <p>エンドツーエンドのシーケンス、並列ファンアウト、評価→再計画の分岐、SSE とフロント状態の対応を読めます。</p>
+          </a>
+        </div>
+
+        <h2>読み進め順</h2>
+        <div class="callout tip">
+          <span class="label">TIP</span>
+          まず <strong>01 システム概要</strong> と <strong>02 アーキテクチャ</strong> で全体像を掴み、次に <strong>03〜05</strong> の詳細設計で実装を理解し、最後に <strong>06 API / SSE 仕様</strong> と <strong>07 処理フロー</strong> でインタフェースと時系列の動きを確認するのがおすすめです。
+        </div>
+
+        <footer class="doc-footer">
+          <div>LangGraph オーケストレータ エージェント — 設計書</div>
+          <div class="nav-links"><span></span><a href="overview.html">システム概要 &rarr;</a></div>
+        </footer>
+      </article>
+    </div>
+  </div>
+</body>
+</html>
