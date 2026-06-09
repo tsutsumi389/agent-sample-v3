@@ -18,6 +18,7 @@ export interface ThoughtEntry {
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+  at: number; // 送信/確定時刻 (epoch ms)
 }
 
 export interface EvalInfo {
@@ -35,6 +36,7 @@ export interface ChatState {
   evaluation: EvalInfo | null;
   answer: string; // ストリーミング中の最終回答
   messages: ChatMessage[];
+  error: string | null; // 直近の実行で発生したエラー(チャット欄に表示)
 }
 
 // SSE data ペイロード(type で判別)
