@@ -1,0 +1,102 @@
+:root {
+  --bg: #0f1115;
+  --panel: #181b22;
+  --panel2: #1f232c;
+  --border: #2a2f3a;
+  --text: #e6e9ef;
+  --muted: #9aa3b2;
+  --accent: #5b9dff;
+  --green: #3fb950;
+  --amber: #d29922;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app { height: 100vh; display: flex; flex-direction: column; }
+
+.app-header {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+}
+.app-header h1 { font-size: 18px; margin: 0; }
+.subtitle { color: var(--muted); font-size: 13px; }
+
+.layout { flex: 1; display: grid; grid-template-columns: 1fr 420px; min-height: 0; }
+
+/* --- チャット --- */
+.chat { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); }
+.messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+
+.bubble { max-width: 80%; padding: 12px 14px; border-radius: 12px; line-height: 1.6; white-space: pre-wrap; }
+.bubble .role { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.bubble.user { align-self: flex-end; background: var(--accent); color: #fff; }
+.bubble.user .role { color: rgba(255,255,255,.8); }
+.bubble.assistant { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); }
+.bubble.working { color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.cursor { animation: blink 1s steps(2) infinite; color: var(--accent); }
+@keyframes blink { 50% { opacity: 0; } }
+
+.composer { display: flex; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--border); }
+.composer textarea {
+  flex: 1; resize: none; background: var(--panel2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font: inherit;
+}
+.btn { border: none; border-radius: 10px; padding: 0 20px; font-weight: 600; cursor: pointer; }
+.btn.send { background: var(--accent); color: #fff; }
+.btn.send:disabled { opacity: .4; cursor: default; }
+.btn.stop { background: #b3322f; color: #fff; }
+
+/* --- 稼働パネル --- */
+.activity { background: var(--panel); overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 16px; }
+.activity h2 { font-size: 15px; margin: 0; }
+.activity h3 { font-size: 13px; margin: 0 0 8px; color: var(--muted); }
+
+.current-node { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.current-node .label { font-size: 12px; color: var(--muted); }
+.badge { padding: 4px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+.badge.live { background: rgba(91,157,255,.18); color: var(--accent); border: 1px solid var(--accent); }
+.badge.idle { background: var(--panel2); color: var(--muted); border: 1px solid var(--border); }
+.status-msg { font-size: 12px; color: var(--muted); }
+
+.block { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.block.grow { flex: 1; min-height: 160px; display: flex; flex-direction: column; }
+
+.memories { margin: 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
+
+/* タスク */
+.tasks { display: flex; flex-direction: column; gap: 10px; }
+.task-group { border-left: 2px solid var(--border); padding-left: 10px; display: flex; flex-direction: column; gap: 6px; }
+.group-label { font-size: 11px; color: var(--amber); }
+.task { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.task.running { color: var(--accent); }
+.task.done { color: var(--text); }
+.task-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 評価 */
+.eval { font-size: 13px; }
+.eval.pass strong { color: var(--green); }
+.eval.fail strong { color: var(--amber); }
+.eval p { margin: 6px 0 0; color: var(--muted); }
+
+/* 思考ログ */
+.thoughts { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; max-height: 360px; }
+.thought { font-size: 12px; }
+.thought-head { color: var(--accent); font-weight: 600; margin-bottom: 2px; }
+.thought-head .tid { color: var(--muted); margin-left: 6px; font-weight: 400; }
+.thought-body { color: var(--muted); white-space: pre-wrap; line-height: 1.5; }
+.empty { color: var(--muted); font-size: 13px; }
+
+/* スピナー */
+.spinner { width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; display: inline-block; animation: spin .8s linear infinite; }
+.spinner.small { width: 11px; height: 11px; }
+@keyframes spin { to { transform: rotate(360deg); } }
