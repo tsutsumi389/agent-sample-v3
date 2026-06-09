@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>バックエンド設計 — LangGraph オーケストレータ 設計書</title>
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">LangGraph オーケストレータ
+        <span class="sub">設計書 / Design Docs</span>
+      </a>
+      <nav>
+        <div class="group-title">概観</div>
+        <a href="overview.html">システム概要</a>
+        <a href="architecture.html">アーキテクチャ</a>
+        <div class="group-title">詳細設計</div>
+        <a href="backend-design.html" class="active">バックエンド設計</a>
+        <a href="frontend-design.html">フロントエンド設計</a>
+        <a href="memory-design.html">長期記憶設計</a>
+        <div class="group-title">インタフェース</div>
+        <a href="api-spec.html">API / SSE 仕様</a>
+        <a href="sequence-flow.html">処理フロー</a>
+      </nav>
+    </aside>
+    <div class="content">
+      <article>
+        <p class="page-eyebrow">詳細設計 / Backend</p>
+        <h1>バックエンド設計</h1>
+        <p class="lead">FastAPI を入口に、LangGraph のオーケストレータ親グラフと 3 つのサブエージェント（Planner / Executor / Evaluator）を独立コンパイル済みグラフとして構成する。<code>graph.astream</code> の出力を SSE へ変換し、各エージェントが <code>writer()</code> で発行するイベントをリアルタイムにクライアントへ中継する。本章は <code>backend/app</code> 配下の実装に即した詳細設計をまとめる。</p>
+
+        <h2>1. モジュール構成</h2>
+        <p><code>backend/app</code> 配下の各モジュールの責務は次のとおり。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>モジュール</th><th>主な定義</th><th>責務</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>main.py</code></td>
+                <td><code>app</code>, <code>lifespan</code>, <code>ChatRequest</code>, <code>/health</code>, <code>/chat/stream</code></td>
+                <td>FastAPI エントリポイント。起動時に埋め込み次元チェックと PostgreSQL 記憶ストア初期化を行い、<code>POST /chat/stream</code> で SSE を返す。CORS は <code>settings.frontend_origin</code> のみ許可。</td>
+              </tr>
+              <tr>
+                <td><code>service.py</code></td>
+                <td><code>run_agent_stream</code>, <code>_sse</code>, <code>_unpack</code></td>
+                <td>LangGraph の <code>astream</code> 出力（custom / updates）を SSE イベントへ変換するアダプタ層。</td>
+              </tr>
+              <tr>
+                <td><code>orchestrator.py</code></td>
+                <td><code>build_orchestrator</code>, <code>orchestrator</code>, 各ノード関数</td>
+                <td>親グラフ。記憶想起 → 計画 → 並列実行 → 評価 → 最終化のフローと、評価後の再計画ルーティングを定義。</td>
+              </tr>
+              <tr>
+                <td><code>llm.py</code></td>
+                <td><code>get_chat_llm</code>, <code>get_embeddings</code></td>
+                <td>ChatOllama / OllamaEmbeddings のファクトリ。<code>reasoning</code> 値のバージョン差異吸収と <code>num_ctx</code> 明示を担う。</td>
+              </tr>
+              <tr>
+                <td><code>config.py</code></td>
+                <td><code>Settings</code>, <code>settings</code></td>
+                <td>環境変数 / <code>.env</code> からの設定読み込み（pydantic-settings）。</td>
+              </tr>
+              <tr>
+                <td><code>agent_utils.py</code></td>
+                <td><code>safe_writer</code>, <code>stream_agent</code>, <code>parse_json</code>, <code>_as_text</code></td>
+                <td>エージェント共通ユーティリティ。LLM ストリーミング送出と JSON 抽出を提供。</td>
+              </tr>
+              <tr>
+                <td><code>agents/planner.py</code></td>
+                <td><code>planner_agent</code>, <code>_plan</code>, <code>_normalize</code></td>
+                <td>ユーザー要求を並列実行可能な独立タスクへ分解するサブエージェント。</td>
+              </tr>
+              <tr>
+                <td><code>agents/executor.py</code></td>
+                <td><code>executor_agent</code>, <code>_execute</code></td>
+                <td>単一 <code>instruction</code> を実行するサブエージェント。Send により並列起動される。</td>
+              </tr>
+              <tr>
+                <td><code>agents/evaluator.py</code></td>
+                <td><code>evaluator_agent</code>, <code>_evaluate</code>, <code>_normalize</code></td>
+                <td>要求と結果から合否を判定し、不合格なら再計画フィードバックを返すサブエージェント。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout note">
+          <span class="label">設計方針</span>
+          各サブエージェントは独立コンパイル済みの <code>StateGraph</code> であり、親グラフと State キーを共有しない。ブリッジノードが「明示的な指示だけ」を渡し、戻り値の必要なキーだけを親 State に書き戻すことで、エージェント間でコンテキスト（会話履歴）を一切引き継がない。
+        </div>
+
+        <h2>2. サブエージェント詳細</h2>
+        <p>3 つのサブエージェントはいずれも単一ノードの最小グラフ（<code>START → 処理ノード → END</code>）として <code>_build()</code> でコンパイルされ、モジュールロード時にインスタンス化される。</p>
+
+        <h3>2.1 Planner エージェント</h3>
+        <div class="card">
+          <p><span class="pill blue">入力</span> <code>PlannerState</code>: <code>request</code>（ユーザー要求）, <code>memories</code>（関連記憶の配列）, <code>feedback</code>（再計画時の指摘）</p>
+          <p><span class="pill green">出力</span> <code>{"plan": list[Task]}</code> — <code>Task</code> は <code>id</code> / <code>instruction</code> / <code>parallel_group</code> を持つ</p>
+          <p><span class="pill purple">役割</span> 要求を互いに独立して並列実行できる具体的なサブタスクに分解する。</p>
+          <p><strong>プロンプト方針:</strong> system プロンプトで「各タスクは 1 つの明確な指示文」「並列実行可能なタスクには同じ <code>parallel_group</code> 番号（0始まり）」「タスクは多くても 5 個、単純なら 1 個」を指示。出力は <code>{"tasks":[{"id":"t1","instruction":"...","parallel_group":0}]}</code> の JSON のみを要求する。human 側には要求本文に加え、<code>memories</code> があれば「関連する過去の記憶」、<code>feedback</code> があれば「前回の計画は不十分でした。次の指摘を反映して再計画してください」を追記する。</p>
+          <p><strong>JSON 抽出 / フォールバック:</strong> <code>stream_agent</code> で得た本文を <code>parse_json</code> → <code>_normalize</code> で <code>list[Task]</code> 化する。<code>_normalize</code> は <code>tasks</code> が非リスト/空、要素が dict でない、<code>instruction</code> が空のものを除外し、<code>id</code> 欠落時は <code>f"t{i+1}"</code> を補完する。正規化結果が空なら、要求そのものを単一タスク（<code>id="t1"</code>, <code>parallel_group=0</code>）にするフォールバックが働く。</p>
+        </div>
+
+        <h3>2.2 Executor エージェント</h3>
+        <div class="card">
+          <p><span class="pill blue">入力</span> <code>ExecutorState</code>: <code>instruction</code>, <code>task_id</code></p>
+          <p><span class="pill green">出力</span> <code>{"result": content}</code>（実行成果物の本文全体）</p>
+          <p><span class="pill purple">役割</span> 与えられた 1 つの <code>instruction</code> だけを忠実に実行する。Send により複数の Executor が並列起動される。</p>
+          <p><strong>プロンプト方針:</strong> system プロンプトで「与えられた 1 つのタスクだけを忠実に実行」「余計な前置きをせず簡潔かつ具体的に」「1 タスク専任であり他のタスクや会話の文脈は知らない」を明示。human には <code>instruction</code> をそのまま渡す。</p>
+          <p><strong>ストリーミング:</strong> 実行前に <code>task_update</code>（<code>status="running"</code>, <code>label=instruction[:60]</code>）を発行し、<code>stream_agent</code> を <code>emit_tokens=True</code> で呼んで本文トークンを逐次送出、完了後に <code>task_update</code>（<code>status="done"</code>）を発行する。JSON 抽出は行わず本文をそのまま結果とする。</p>
+        </div>
+
+        <h3>2.3 Evaluator エージェント</h3>
+        <div class="card">
+          <p><span class="pill blue">入力</span> <code>EvaluatorState</code>: <code>request</code>, <code>results</code>（タスク結果の配列）</p>
+          <p><span class="pill green">出力</span> <code>{"evaluation": Evaluation}</code> — <code>Evaluation</code> は <code>passed</code>（bool）/ <code>feedback</code>（str）</p>
+          <p><span class="pill purple">役割</span> 元の要求と各タスク結果を読み、要求が十分に満たされているか判定。不十分なら再計画用のフィードバックを返す。</p>
+          <p><strong>プロンプト方針:</strong> system プロンプトで品質評価者として判定を求め、出力は <code>{"passed": true/false, "feedback": "..."}</code> の JSON のみを要求する（passed が true なら feedback は空文字でよい）。human には要求本文と、各結果を <code>[タスク {task_id}] 指示: ... / 結果: ...</code> 形式で連結したテキストを渡す。</p>
+          <p><strong>JSON 抽出 / フォールバック:</strong> <code>parse_json</code> の結果が空でなければ <code>_normalize</code>（<code>passed</code> を bool 化、欠落時は <code>True</code> / <code>feedback</code> を str 化）し、空なら <code>empty_evaluation()</code> を使う。判定後に <code>evaluation</code> イベントと、合否に応じた <code>node_complete</code> ステータス（「合格」/「再計画が必要」）を発行する。</p>
+        </div>
+
+        <h2>3. LLM ファクトリ（llm.py）</h2>
+        <p><code>get_chat_llm</code> は <code>ChatOllama</code> を生成するファクトリで、<code>@lru_cache(maxsize=None)</code> により引数（<code>streaming</code>, <code>temperature</code>）ごとにキャッシュされる。ChatOllama はステートレス（<code>astream</code> は渡したメッセージのみで推論）なため、全エージェントで同一インスタンスを共有しても会話履歴は混ざらない。</p>
+        <pre><code>@lru_cache(maxsize=None)
+def get_chat_llm(*, streaming: bool = True, temperature: float = 0.0) -&gt; ChatOllama:
+    base = dict(
+        model=settings.chat_model,
+        base_url=settings.ollama_base_url,
+        temperature=temperature,
+        num_ctx=settings.num_ctx,
+        streaming=streaming,
+    )
+    # reasoning パラメータをバージョン差異に強い形で適用する。
+    for reasoning in (settings.reasoning_effort, True, None):
+        try:
+            kwargs = dict(base)
+            if reasoning is not None:
+                kwargs["reasoning"] = reasoning
+            return ChatOllama(**kwargs)
+        except Exception:  # noqa: BLE001 - バージョン非対応値を順に試す
+            continue
+    return ChatOllama(**base)</code></pre>
+        <div class="grid">
+          <div class="card">
+            <h3>reasoning_effort</h3>
+            <p><code>settings.reasoning_effort</code>（既定 <code>"medium"</code>、low / medium / high）→ <code>True</code> → <code>None</code> の順にフォールバックする。gpt-oss では <code>reasoning="medium"</code> を渡すと思考（CoT）が <code>content</code> ではなく <code>additional_kwargs['reasoning_content']</code> に分離され、UI の「思考」表示に使える。古い langchain-ollama は文字列値を受け付けず <code>bool_parsing</code> エラーになるため、段階的に試行する。</p>
+          </div>
+          <div class="card">
+            <h3>num_ctx</h3>
+            <p><code>settings.num_ctx</code>（既定 <code>8192</code>）を明示的に渡す。明示しないと Ollama がコンテキストを約 4096 トークンに切り詰めてしまうため、必ず指定する。</p>
+          </div>
+          <div class="card">
+            <h3>get_embeddings</h3>
+            <p><code>OllamaEmbeddings</code> を <code>@lru_cache(maxsize=1)</code> で単一生成。<code>model=settings.embed_model</code>（既定 <code>nomic-embed-text</code>）、<code>base_url=settings.ollama_base_url</code>。長期記憶のベクトル化に用いる。</p>
+          </div>
+        </div>
+
+        <h2>4. 共通ユーティリティ（agent_utils.py）</h2>
+
+        <h3>4.1 safe_writer</h3>
+        <p>グラフ実行コンテキスト内なら LangGraph の <code>get_stream_writer()</code> を返し、コンテキスト外（ルータ関数やユニットテスト）では no-op（<code>lambda *_args, **_kwargs: None</code>）を返すラッパー。例外を握りつぶすことで、どこから呼んでも安全に <code>writer(...)</code> を呼べる。</p>
+
+        <h3>4.2 stream_agent</h3>
+        <p>LLM を <code>astream</code> し、本文と思考を逐次イベント送出しながら <code>(本文全体, 思考全体)</code> のタプルを返す中核関数。</p>
+        <pre><code>async def stream_agent(
+    llm: BaseChatModel,
+    messages: list[BaseMessage] | list[tuple[str, str]],
+    *,
+    agent: str,
+    writer,
+    task_id: str | None = None,
+    emit_tokens: bool = False,
+) -&gt; tuple[str, str]:
+    ...
+    async for chunk in llm.astream(messages):
+        text = _as_text(getattr(chunk, "content", ""))
+        if text:
+            content_parts.append(text)
+            if emit_tokens:
+                writer({"type": "token", "agent": agent, "task_id": task_id, "content": text})
+
+        extra = getattr(chunk, "additional_kwargs", {}) or {}
+        reasoning = extra.get("reasoning_content") or extra.get("reasoning")
+        if reasoning:
+            reasoning_parts.append(reasoning)
+            writer({"type": "thinking", "agent": agent, "task_id": task_id, "content": reasoning})
+
+    return "".join(content_parts), "".join(reasoning_parts)</code></pre>
+        <ul>
+          <li><strong>token イベント:</strong> 本文差分（<code>emit_tokens=True</code> のときのみ送出）。Executor と finalize で有効。Planner / Evaluator は本文を送らず JSON だけ取り出す。</li>
+          <li><strong>thinking イベント:</strong> <code>reasoning_content</code> または <code>reasoning</code> の差分。バージョン差異に両対応。</li>
+          <li><code>_as_text</code> が <code>content</code> を str / list（テキストブロック）いずれでも文字列へ正規化する。</li>
+        </ul>
+
+        <h3>4.3 parse_json</h3>
+        <p>不安定な LLM の構造化出力から JSON オブジェクトを頑健に取り出す。コードフェンス除去 → 直接 <code>json.loads</code> → 最初の <code>{...}</code> ブロック抽出、の順に試し、いずれも失敗すれば <code>{}</code> を返す。フェンスは正規表現 <code>```(?:json)?\s*(.*?)\s*```</code>（DOTALL）で検出する。</p>
+
+        <h2>5. ストリーム変換ロジック（service.py）</h2>
+        <p><code>run_agent_stream</code> が <code>orchestrator.astream</code> を消費して SSE イベントの非同期ジェネレータを返す。<code>stream_mode=["custom", "updates"]</code> と <code>subgraphs=True</code> を指定することで、サブエージェント内部の <code>writer</code> イベントも親ストリームへ浮上させている。</p>
+        <pre><code>async for item in orchestrator.astream(
+        inputs,
+        config=config,
+        stream_mode=["custom", "updates"],
+        subgraphs=True,
+):
+    mode, chunk = _unpack(item)
+
+    if mode == "custom" and isinstance(chunk, dict):
+        event = chunk.get("type", "status")
+        yield _sse(event, chunk)
+
+    elif mode == "updates" and isinstance(chunk, dict):
+        for node in chunk:
+            yield _sse("status",
+                {"type": "status", "node": node, "state": "node_complete", "message": ""})</code></pre>
+        <div class="grid">
+          <div class="card">
+            <h3>_unpack による形の正規化</h3>
+            <p><code>subgraphs=True</code> + 複数 <code>stream_mode</code> では出力が <code>(namespace, mode, chunk)</code> の 3 要素、単一モードでは <code>(namespace, chunk)</code> の 2 要素になりうる。<code>_unpack</code> は要素数で分岐し、3 要素なら <code>(mode, chunk)</code>、2 要素ならそのまま、それ以外は <code>("custom", item)</code> として正規化する。</p>
+          </div>
+          <div class="card">
+            <h3>イベント変換</h3>
+            <p><strong>custom</strong>: 各ノードが <code>writer()</code> で発行した dict をそのまま中継し、<code>type</code> を SSE の <code>event</code> 名にする（<code>status</code> / <code>token</code> / <code>thinking</code> / <code>plan</code> / <code>task_update</code> / <code>evaluation</code> / <code>memory</code> / <code>final</code> など）。<strong>updates</strong>: ノード完了の <code>{node: delta}</code> を <code>node_complete</code> ステータスへ変換する。</p>
+          </div>
+        </div>
+        <p>処理の前後で制御イベントを補う。冒頭で <code>orchestrator / running</code> の「エージェント起動」ステータスを送り、ループを <code>try/except</code> で囲んで例外時は <code>error</code> イベントを送出、最後に SSE には終了通知が無いため終端センチネル <code>_sse("final", "[DONE]")</code> を必ず送る。<code>_sse</code> はデータを <code>json.dumps(..., ensure_ascii=False)</code> で文字列化し <code>{"event":..., "data":...}</code> 形にする。</p>
+        <p>なお <code>main.py</code> の <code>event_source</code> はループ内で <code>request.is_disconnected()</code> を確認し、クライアント切断時に実行を打ち切って無駄な計算を止める。</p>
+
+        <h2>6. 評価 → 再計画ループ</h2>
+        <p>親グラフのフローは次のとおり。<code>evaluator</code> 後の条件エッジ <code>route_after_eval</code> が、合否と反復回数で <code>finalize</code> か <code>replan</code>（= <code>planner</code> へ戻る）かを決める。</p>
+        <div class="diagram"><pre>  START
+    │
+    ▼
+ recall_memory ── retrieved_memories, iteration=0
+    │
+    ▼
+ planner ◀───────────────┐ (replan: feedback を反映して再計画)
+    │ assign_executors    │
+    │ (Send 並列ファンアウト) │
+    ▼                     │
+ executor × N ── task_results (operator.add でマージ)
+    │ (fan-in バリア)      │
+    ▼                     │
+ evaluator ── evaluation, iteration += 1
+    │                     │
+    ▼ route_after_eval    │
+  ┌─────────────┐         │
+  │ passed?      │── No ──┘  (かつ iteration &lt; MAX_ITERATIONS)
+  │ or 上限到達?  │
+  └─────┬───────┘
+        │ Yes
+        ▼
+    finalize ── final_answer, remember_async
+        │
+        ▼
+       END</pre></div>
+        <pre><code>def route_after_eval(state: ParentState) -&gt; str:
+    evaluation = state.get("evaluation") or {}
+    if evaluation.get("passed", True) or state.get("iteration", 0) &gt;= settings.max_iterations:
+        return "finalize"
+    return "replan"</code></pre>
+        <div class="callout warn">
+          <span class="label">MAX_ITERATIONS 上限</span>
+          反復回数 <code>iteration</code> は <code>recall_memory</code> で 0 に初期化され、<code>evaluator_node</code> が完了するたびに +1 される。<code>route_after_eval</code> は <code>passed</code> が真（<strong>既定は <code>True</code></strong>、評価が取れない場合は合格扱い）か、<code>iteration</code> が <code>settings.max_iterations</code>（既定 <code>2</code>）以上なら <code>finalize</code> へ。それ以外は <code>replan</code> として <code>planner</code> に戻り、<code>evaluation.feedback</code> を渡して再計画する。これにより評価ループが無限に回ることを防ぐ。
+        </div>
+        <p>再計画時、<code>planner_node</code> は <code>(state.get("evaluation") or {}).get("feedback", "")</code> を取り出して Planner へ渡す。Planner はこの feedback を human プロンプトに反映し、指摘を踏まえた新しい計画を生成する。最終化（<code>finalize</code>）では各タスク結果を連結したテキストを <code>FINALIZE_SYSTEM</code> とともに <code>stream_agent</code>（<code>emit_tokens=True</code>）へ渡して最終回答を生成し、<code>final</code> イベント送出後に <code>remember_async</code> で会話を背景記憶化する（ホットパスをブロックしない）。</p>
+
+        <footer class="doc-footer">
+          <div>LangGraph オーケストレータ エージェント — 設計書</div>
+          <div class="nav-links"><a href="architecture.html">&larr; アーキテクチャ</a><a href="frontend-design.html">フロントエンド設計 &rarr;</a></div>
+        </footer>
+      </article>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>フロントエンド設計 — LangGraph オーケストレータ 設計書</title>
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">LangGraph オーケストレータ
+        <span class="sub">設計書 / Design Docs</span>
+      </a>
+      <nav>
+        <div class="group-title">概観</div>
+        <a href="overview.html">システム概要</a>
+        <a href="architecture.html">アーキテクチャ</a>
+        <div class="group-title">詳細設計</div>
+        <a href="backend-design.html">バックエンド設計</a>
+        <a href="frontend-design.html" class="active">フロントエンド設計</a>
+        <a href="memory-design.html">長期記憶設計</a>
+        <div class="group-title">インタフェース</div>
+        <a href="api-spec.html">API / SSE 仕様</a>
+        <a href="sequence-flow.html">処理フロー</a>
+      </nav>
+    </aside>
+    <div class="content">
+      <article>
+        <p class="page-eyebrow">詳細設計 / フロントエンド</p>
+        <h1>フロントエンド設計</h1>
+        <p class="lead">React + TypeScript + Vite で構築したシングルページ UI。SSE（Server-Sent Events）でバックエンドの実行状況をリアルタイムに受信し、チャット欄とエージェント稼働パネルを同時に更新する。本章ではコンポーネント構成・<code>useAgentStream</code> フックによるイベント駆動の状態管理・型定義・可視化 UX を、ソースコードに基づき詳説する。</p>
+
+        <h2>1. 技術スタックとエントリポイント</h2>
+        <div class="grid">
+          <div class="card">
+            <h3>ビルド / 配信</h3>
+            <p>Vite（<code>@vitejs/plugin-react</code>）。開発サーバはポート <span class="pill blue">5173</span>。<code>/chat</code> と <code>/health</code> はバックエンド（<code>http://localhost:8000</code>）へ <code>changeOrigin: true</code> でプロキシする（<code>vite.config.ts</code>）。</p>
+          </div>
+          <div class="card">
+            <h3>SSE クライアント</h3>
+            <p><code>@microsoft/fetch-event-source</code> を採用。標準 <code>EventSource</code> と異なり <code>POST</code> + <code>JSON</code> ボディでの SSE 受信が可能。</p>
+          </div>
+          <div class="card">
+            <h3>マウント</h3>
+            <p><code>main.tsx</code> が <code>#root</code> に <code>&lt;React.StrictMode&gt;</code> でラップした <code>&lt;App /&gt;</code> をレンダリング。スタイルは <code>styles.css</code> を読み込み。</p>
+          </div>
+        </div>
+
+        <h2>2. コンポーネント構成</h2>
+        <p><code>App</code> は単一フックの状態を 2 つの主要パネルへ配り、画面を左右 2 カラム（<code>.layout</code>）に分けて構成する。</p>
+        <div class="diagram"><pre>
+                         ┌──────────────────────────────────────┐
+                         │              App.tsx                  │
+                         │   const { state, send, stop }         │
+                         │       = useAgentStream()              │  ← 状態の唯一の源
+                         └───────────────┬───────────────────────┘
+                                         │ state を props で配布
+                  ┌──────────────────────┴───────────────────────┐
+                  ▼                                               ▼
+        ┌───────────────────────┐                   ┌───────────────────────────┐
+        │     ChatWindow        │                   │     AgentActivityPanel     │
+        │  messages / answer    │                   │  現在ノード / 記憶 / 評価   │
+        │  自動スクロール        │                   └───────────┬───────────────┘
+        │  ┌──────────────────┐ │                       ┌────────┴─────────┐
+        │  │    Composer      │ │                       ▼                  ▼
+        │  │ textarea + 送信   │ │            ┌──────────────────┐ ┌──────────────────┐
+        │  │ / 停止ボタン       │ │            │  TaskChecklist   │ │   ThoughtsFeed   │
+        │  └──────────────────┘ │            │ 並列グループ表示   │ │  思考ログ追記     │
+        └───────────────────────┘            └──────────────────┘ └──────────────────┘
+        </pre></div>
+
+        <h3>2.1 各コンポーネントの責務</h3>
+        <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>コンポーネント</th><th>ファイル</th><th>責務</th><th>主な props / 状態</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>App</code></td><td>App.tsx</td><td>ヘッダ表示と 2 カラムレイアウト。<code>useAgentStream</code> を 1 度だけ呼び、<code>state</code> / <code>send</code> / <code>stop</code> を子へ配布。</td><td>—（フックが状態を保持）</td></tr>
+            <tr><td><code>ChatWindow</code></td><td>ChatWindow.tsx</td><td>確定メッセージ（<code>messages</code>）とストリーミング中の回答（<code>answer</code>）を吹き出し表示。<code>messages</code> / <code>answer</code> 変化時に末尾へ自動スクロール。回答未到着時はスピナーと <code>statusMessage</code> を表示。</td><td><code>state</code>, <code>onSend</code>, <code>onStop</code></td></tr>
+            <tr><td><code>Composer</code></td><td>Composer.tsx</td><td>入力欄。<code>Enter</code> 送信 / <code>Shift+Enter</code> 改行。実行中は「停止」ボタン、待機中は「送信」ボタン（空文字は <code>disabled</code>）。</td><td><code>running</code>, <code>onSend</code>, <code>onStop</code> / ローカル <code>text</code></td></tr>
+            <tr><td><code>AgentActivityPanel</code></td><td>AgentActivityPanel.tsx</td><td>稼働状況の集約パネル。現在ノードのバッジ、想起記憶、計画タスク、評価結果、思考ログを条件付きで描画。</td><td><code>state</code></td></tr>
+            <tr><td><code>TaskChecklist</code></td><td>TaskChecklist.tsx</td><td><code>tasks</code> を <code>parallelGroup</code> でグルーピングしグループ番号昇順に表示。同一グループは「同時実行」ラベル付き。状態別アイコン（⚪/🔵/✅/❌）と running 時のスピナー。</td><td><code>tasks</code></td></tr>
+            <tr><td><code>ThoughtsFeed</code></td><td>ThoughtsFeed.tsx</td><td>思考エントリを時系列に列挙。エージェント名は <code>NODE_LABELS</code> で日本語化、<code>taskId</code> があれば <code>#id</code> を付与。更新時に末尾へ自動スクロール。空時はプレースホルダ。</td><td><code>thoughts</code></td></tr>
+          </tbody>
+        </table>
+        </div>
+
+        <h2>3. useAgentStream フック（中核の状態管理）</h2>
+        <p><code>useReducer</code> でアプリ全状態（<code>ChatState</code>）を一元管理し、SSE 受信を <code>useRef</code> 保持の <code>AbortController</code> で制御する。<code>send</code> / <code>stop</code> は <code>useCallback</code> で安定化している。</p>
+
+        <h3>3.1 アクションとライフサイクル</h3>
+        <p>reducer は 4 種の <code>Action</code> を処理する。<code>start</code> で状態をリセットしユーザメッセージを追加、<code>event</code> で SSE イベントを <code>applyEvent</code> に委譲、<code>finish</code> でストリーム中の <code>answer</code> を確定メッセージへコミット、<code>fail</code> でエラー文言を設定する。</p>
+        <pre><code>type Action =
+  | { kind: "start"; message: string }
+  | { kind: "event"; event: AgentEvent }
+  | { kind: "finish" }
+  | { kind: "fail"; message: string };
+
+case "start":
+  return {
+    ...initialState,
+    messages: [...state.messages, { role: "user", content: action.message }],
+    running: true,
+    statusMessage: "起動中…",
+  };
+case "finish": {
+  // ストリーミングした answer を確定メッセージにコミット
+  const msgs = state.answer
+    ? [...state.messages, { role: "assistant" as const, content: state.answer }]
+    : state.messages;
+  return { ...state, running: false, currentNode: null, messages: msgs, answer: "" };
+}</code></pre>
+        <div class="callout note"><span class="label">設計ポイント</span> <code>start</code> は <code>...initialState</code> を展開してタスク・思考・評価などを毎ターン破棄する。前ターンの <code>messages</code> のみ引き継ぎ、新規実行ごとに稼働パネルをクリーンな状態から再構築する。</div>
+
+        <h3>3.2 SSE 受信ループ</h3>
+        <p><code>fetchEventSource("/chat/stream", ...)</code> を <code>POST</code> で開く。<code>openWhenHidden: true</code> によりバックグラウンドタブでも実行を継続する。各フレームは <code>onmessage</code> で処理し、<code>[DONE]</code> を受けたら <code>finish</code> を発行して <code>abort()</code> する。</p>
+        <pre><code>onmessage(msg) {
+  if (msg.data === "[DONE]") {
+    dispatch({ kind: "finish" });
+    ctrl.abort();
+    return;
+  }
+  if (!msg.data) return;
+  try {
+    const parsed = JSON.parse(msg.data) as AgentEvent;
+    dispatch({ kind: "event", event: parsed });
+  } catch {
+    // パースできないフレームは無視
+  }
+},
+onerror(err) {
+  dispatch({ kind: "fail", message: String(err) });
+  throw err; // 自動リトライを止める
+},</code></pre>
+        <div class="callout tip"><span class="label">エラー設計</span> <code>onerror</code> 内で <code>throw err</code> することで <code>fetch-event-source</code> の自動リトライを無効化し、無限再接続を防いでいる。<code>stop()</code> は <code>ctrlRef.current?.abort()</code> 後に <code>finish</code> を発行してユーザ起点の停止を実装する。</div>
+
+        <h3>3.3 イベント種別ごとの状態更新（applyEvent）</h3>
+        <p><code>applyEvent</code> は <code>AgentEvent.type</code> で分岐し、各イベントを <code>ChatState</code> の対応フィールドへ反映する。すべて新オブジェクトを返すイミュータブル更新。</p>
+        <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>type</th><th>ペイロード主要フィールド</th><th>状態更新</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><span class="pill blue">status</span></td><td><code>node</code>, <code>state</code>("running"/"node_complete"), <code>message?</code></td><td><code>state === "running"</code> のとき <code>currentNode</code> を更新。<code>message</code> があれば <code>statusMessage</code> を更新。</td></tr>
+            <tr><td><span class="pill purple">thinking</span></td><td><code>agent</code>, <code>task_id?</code>, <code>content</code></td><td><code>thoughts</code> へ追加。直前エントリと <code>agent</code> / <code>taskId</code> が一致する場合は <code>content</code> を末尾連結してまとめる。</td></tr>
+            <tr><td><span class="pill purple">token</span></td><td><code>agent</code>, <code>task_id?</code>, <code>content</code></td><td><code>answer</code> に <code>content</code> を逐次追記（finalize 本文のストリーミング）。</td></tr>
+            <tr><td><span class="pill green">plan</span></td><td><code>tasks[]</code>（<code>id</code>, <code>instruction</code>, <code>parallel_group</code>）</td><td><code>tasks</code> を再構築。<code>instruction</code>→<code>label</code>、<code>parallel_group</code>→<code>parallelGroup</code> に写像し、全件 <code>status: "pending"</code>。</td></tr>
+            <tr><td><span class="pill green">task_update</span></td><td><code>task_id</code>, <code>status</code>, <code>label</code></td><td>該当 <code>id</code> のタスクの <code>status</code> を更新。<code>label</code> があれば差し替え。</td></tr>
+            <tr><td><span class="pill warn">evaluation</span></td><td><code>passed</code>, <code>feedback</code></td><td><code>evaluation</code> に <code>{ passed, feedback }</code> を設定。</td></tr>
+            <tr><td><span class="pill blue">memory</span></td><td><code>items[]</code></td><td><code>memories</code> を <code>items</code> で置換。</td></tr>
+            <tr><td><span class="pill blue">final</span></td><td><code>answer</code></td><td><code>answer</code> を確定値で上書き（空なら既存値を維持）。</td></tr>
+            <tr><td><span class="pill warn">error</span></td><td><code>message</code></td><td><code>statusMessage</code> を <code>エラー: {message}</code> に設定。</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <p>連続する思考のマージは、トークン単位で届く思考断片を 1 エントリに集約するための処理である。</p>
+        <pre><code>case "thinking": {
+  // 同一 agent/task の連続する思考は末尾に追記してまとめる
+  const last = state.thoughts[state.thoughts.length - 1];
+  if (last &amp;&amp; last.agent === ev.agent &amp;&amp; last.taskId === (ev.task_id ?? null)) {
+    const merged = [...state.thoughts];
+    merged[merged.length - 1] = { ...last, content: last.content + ev.content };
+    return { ...state, thoughts: merged };
+  }
+  return {
+    ...state,
+    thoughts: [...state.thoughts, { agent: ev.agent, taskId: ev.task_id ?? null, content: ev.content }],
+  };
+}</code></pre>
+
+        <h2>4. 型定義（types.ts）</h2>
+        <p>バックエンドの SSE イベントとフロントの状態モデルを TypeScript の型で表現する。</p>
+        <div class="table-wrap">
+        <table>
+          <thead><tr><th>型</th><th>定義 / フィールド</th><th>用途</th></tr></thead>
+          <tbody>
+            <tr><td><code>TaskStatus</code></td><td><code>"pending" | "running" | "done" | "error"</code></td><td>タスクの進行状態。</td></tr>
+            <tr><td><code>AgentTask</code></td><td><code>id</code>, <code>label</code>, <code>status: TaskStatus</code>, <code>parallelGroup: number</code></td><td>チェックリスト 1 行分。</td></tr>
+            <tr><td><code>ThoughtEntry</code></td><td><code>agent</code>, <code>taskId?: string | null</code>, <code>content</code></td><td>思考ログ 1 エントリ。</td></tr>
+            <tr><td><code>ChatMessage</code></td><td><code>role: "user" | "assistant"</code>, <code>content</code></td><td>確定チャット履歴。</td></tr>
+            <tr><td><code>EvalInfo</code></td><td><code>passed: boolean</code>, <code>feedback: string</code></td><td>評価結果。</td></tr>
+            <tr><td><code>ChatState</code></td><td><code>running</code>, <code>currentNode</code>, <code>statusMessage</code>, <code>tasks</code>, <code>thoughts</code>, <code>memories</code>, <code>evaluation</code>, <code>answer</code>, <code>messages</code></td><td>UI 全体の単一ステート。</td></tr>
+            <tr><td><code>AgentEvent</code></td><td>判別共用体（<code>type</code> 判別）: status / thinking / token / plan / task_update / evaluation / memory / final / error</td><td>SSE data ペイロードの型。</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <div class="callout note"><span class="label">命名の橋渡し</span> SSE 側は <code>task_id</code> / <code>parallel_group</code>（スネークケース）だが、フロント状態は <code>taskId</code> / <code>parallelGroup</code>（キャメルケース）に変換される。この写像は <code>applyEvent</code> が担う。</div>
+
+        <h3>4.1 表示名マッピング（labels.ts）</h3>
+        <p><code>NODE_LABELS</code> がノード/エージェント ID を日本語表示名に変換する。<code>AgentActivityPanel</code> の現在ノードバッジと <code>ThoughtsFeed</code> のエージェント名で共用する。</p>
+        <div class="table-wrap">
+        <table>
+          <thead><tr><th>キー</th><th>表示名</th></tr></thead>
+          <tbody>
+            <tr><td><code>orchestrator</code></td><td>オーケストレータ</td></tr>
+            <tr><td><code>memory</code> / <code>recall_memory</code></td><td>記憶想起</td></tr>
+            <tr><td><code>planner</code></td><td>プランナー</td></tr>
+            <tr><td><code>executor</code></td><td>エグゼキューター</td></tr>
+            <tr><td><code>evaluator</code></td><td>エヴァリュエーター</td></tr>
+            <tr><td><code>finalize</code></td><td>最終統合</td></tr>
+          </tbody>
+        </table>
+        </div>
+
+        <h2>5. リアルタイム可視化 UX</h2>
+        <p>同一の <code>ChatState</code> を左右のパネルが購読することで、チャットと稼働パネルが同時に更新される。SSE イベントが届くたびに reducer が新状態を返し、React の再レンダリングで両パネルが反映される。</p>
+
+        <div class="grid">
+          <div class="card">
+            <h3>チャット側（ChatWindow）</h3>
+            <p><code>running &amp;&amp; answer</code> のときは <code>token</code> で追記される回答にカーソル <code>▍</code> を添えてストリーミング表示。<code>running</code> だが <code>answer</code> 未着のときはスピナー＋<code>statusMessage</code>。<code>messages</code> / <code>answer</code> の変化で末尾へ自動スクロール。</p>
+          </div>
+          <div class="card">
+            <h3>現在ノード表示</h3>
+            <p><code>status</code> イベントの <code>node</code> を <code>NODE_LABELS</code> で日本語化しバッジ表示。実行中は <code>live</code>、停止後は「待機中」(<code>idle</code>)。<code>statusMessage</code> を補足表示。</p>
+          </div>
+          <div class="card">
+            <h3>タスクチェックリスト</h3>
+            <p><code>plan</code> でタスク一覧が生成され、<code>task_update</code> で個別状態が遷移。<code>parallelGroup</code> が同じタスクは「グループN（同時実行）」としてまとめ、並列実行を視覚化する。</p>
+          </div>
+          <div class="card">
+            <h3>思考フィード</h3>
+            <p><code>thinking</code> を時系列に表示。同一 agent/task の連続断片はマージされ、長文思考が 1 ブロックとして滑らかに伸びる。新規追加ごとに自動スクロール。</p>
+          </div>
+        </div>
+
+        <p>1 ターンのイベント到着順と UI 反映を時系列で示す。</p>
+        <div class="diagram"><pre>
+ send() ─▶ start                ChatWindow              AgentActivityPanel
+   │   ┌──────────────┐         ──────────              ──────────────────
+   │   │ user msg 追加 │         user 吹き出し            「起動中…」
+   ▼   └──────────────┘
+ SSE  status(memory)            spinner + statusMessage  バッジ: 記憶想起
+ SSE  memory(items)             ─                        想起した記憶リスト
+ SSE  status(planner)           spinner                  バッジ: プランナー
+ SSE  plan(tasks)               ─                        チェックリスト生成(pending)
+ SSE  thinking(executor,#t1)    ─                        思考ログに追記(マージ)
+ SSE  task_update(t1, running)  ─                        🔵 + spinner
+ SSE  task_update(t1, done)     ─                        ✅
+ SSE  evaluation(passed)        ─                        評価: ✅ 合格
+ SSE  status(finalize)          spinner                  バッジ: 最終統合
+ SSE  token(...)×N              answer ストリーミング+▍   ─
+ SSE  [DONE] ─▶ finish          answer を確定メッセージ化  バッジ: 待機中
+        </pre></div>
+
+        <div class="callout warn"><span class="label">状態の単一源泉</span> UI 状態は <code>useAgentStream</code> の <code>ChatState</code> ただ 1 つ。コンポーネントはローカル状態を最小限（<code>Composer</code> の入力テキスト、自動スクロール用 <code>ref</code>）に留め、表示は全て props 経由の純粋関数的レンダリングで統一されている。</div>
+        <footer class="doc-footer">
+          <div>LangGraph オーケストレータ エージェント — 設計書</div>
+          <div class="nav-links"><a href="backend-design.html">&larr; バックエンド設計</a><a href="memory-design.html">長期記憶設計 &rarr;</a></div>
+        </footer>
+      </article>
+    </div>
+  </div>
+</body>
+</html>

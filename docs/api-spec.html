@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>API / SSE 仕様 — LangGraph オーケストレータ 設計書</title>
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">LangGraph オーケストレータ
+        <span class="sub">設計書 / Design Docs</span>
+      </a>
+      <nav>
+        <div class="group-title">概観</div>
+        <a href="overview.html">システム概要</a>
+        <a href="architecture.html">アーキテクチャ</a>
+        <div class="group-title">詳細設計</div>
+        <a href="backend-design.html">バックエンド設計</a>
+        <a href="frontend-design.html">フロントエンド設計</a>
+        <a href="memory-design.html">長期記憶設計</a>
+        <div class="group-title">インタフェース</div>
+        <a href="api-spec.html" class="active">API / SSE 仕様</a>
+        <a href="sequence-flow.html">処理フロー</a>
+      </nav>
+    </aside>
+    <div class="content">
+      <article>
+        <p class="page-eyebrow">インタフェース</p>
+        <h1>API / SSE 仕様</h1>
+        <p class="lead">FastAPI が公開する HTTP エンドポイントと、<code>POST /chat/stream</code> が返す Server-Sent Events（SSE）のイベント契約を定義する。バックエンドの <code>main.py</code> / <code>service.py</code> が発行するイベント名・JSON 構造と、フロントエンド（<code>useAgentStream.ts</code> / <code>types.ts</code>）が受信する型を突き合わせて記載する。</p>
+
+        <h2>1. エンドポイント一覧</h2>
+        <p>FastAPI アプリ（<code>title="LangGraph Orchestrator Agent"</code>）が公開するエンドポイントは 2 つ。中心は SSE ストリームを返す <code>POST /chat/stream</code> である。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>メソッド</th><th>パス</th><th>概要</th><th>レスポンス</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="pill green">GET</span></td>
+                <td><code>/health</code></td>
+                <td>ヘルスチェック。設定中のチャットモデル / 埋め込みモデル名を返す。</td>
+                <td><code>application/json</code></td>
+              </tr>
+              <tr>
+                <td><span class="pill blue">POST</span></td>
+                <td><code>/chat/stream</code></td>
+                <td>ユーザのメッセージをエージェントに渡し、実行過程と最終回答を SSE でストリーム配信する。</td>
+                <td><code>text/event-stream</code>（<code>EventSourceResponse</code>）</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>GET /health のレスポンス例</h3>
+        <pre><code>{
+  "status": "ok",
+  "chat_model": "&lt;settings.chat_model&gt;",
+  "embed_model": "&lt;settings.embed_model&gt;"
+}</code></pre>
+
+        <h2>2. リクエストボディ（POST /chat/stream）</h2>
+        <p>リクエストボディは <code>main.py</code> の <code>ChatRequest</code>（Pydantic <code>BaseModel</code>）で定義される。<code>Content-Type: application/json</code> で送信する。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>フィールド</th><th>型</th><th>必須</th><th>デフォルト</th><th>説明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>message</code></td><td><code>str</code></td><td><span class="pill warn">必須</span></td><td>—</td><td>ユーザの入力メッセージ。エージェントの <code>user_request</code> として渡される。</td></tr>
+              <tr><td><code>user_id</code></td><td><code>str</code></td><td>任意</td><td><code>"default-user"</code></td><td>長期記憶の名前空間に使うユーザ識別子。</td></tr>
+              <tr><td><code>thread_id</code></td><td><code>str | None</code></td><td>任意</td><td><code>null</code></td><td>会話スレッド ID。未指定（<code>null</code>）の場合はサーバ側で <code>uuid.uuid4()</code> を生成して使用する。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note"><span class="label">補足</span> フロントエンドの <code>useAgentStream.ts</code> は <code>{ message, user_id }</code> のみを送信しており、<code>thread_id</code> は送らないため毎リクエストでサーバが新規スレッド ID を採番する。</div>
+
+        <h3>State への写像</h3>
+        <p>受け取ったリクエストは <code>run_agent_stream(message, user_id, thread_id)</code> に渡され、グラフ入力と config に展開される。</p>
+        <div class="diagram"><pre>POST /chat/stream
+  └─ ChatRequest { message, user_id, thread_id? }
+        │
+        ├─ inputs = { "user_request": message, "user_id": user_id }
+        └─ config = { "configurable": { "user_id", "thread_id" } }
+              │
+              ▼
+        orchestrator.astream(inputs, config,
+            stream_mode=["custom","updates"], subgraphs=True)</pre></div>
+
+        <h2>3. SSE イベント仕様（章の中心）</h2>
+        <p>SSE フレームは <code>service.py</code> の <code>_sse(event, data)</code> が生成する。<code>event</code> が SSE のイベント名、<code>data</code> は <code>json.dumps(..., ensure_ascii=False)</code> でシリアライズされた JSON 文字列になる。</p>
+        <pre><code>def _sse(event, data):
+    return {"event": event, "data": json.dumps(data, ensure_ascii=False)}</code></pre>
+
+        <h3>3.1 イベントの発生源</h3>
+        <p><code>service.py</code> は <code>orchestrator.astream(stream_mode=["custom","updates"], subgraphs=True)</code> を消費し、3 系統のフレームを生成する。</p>
+        <div class="grid">
+          <div class="card">
+            <h3><span class="pill purple">custom</span> ノードの writer 発行</h3>
+            <p>各ノードが <code>writer()</code> で発行した <code>dict</code>（<code>type</code> キーを持つ）をそのまま中継する。イベント名は <code>chunk.get("type", "status")</code>。<code>subgraphs=True</code> によりサブエージェント内部のイベントも親ストリームに浮上する。</p>
+          </div>
+          <div class="card">
+            <h3><span class="pill blue">updates</span> ノード完了</h3>
+            <p>ノード完了の <code>{node: delta}</code> を <code>status</code> イベント（<code>state="node_complete"</code>）へ変換する。</p>
+          </div>
+          <div class="card">
+            <h3><span class="pill green">sentinel</span> 終端</h3>
+            <p>ストリーム末尾で必ず <code>final</code> イベントとして <code>"[DONE]"</code> を 1 回送る。SSE には終了通知が無いため、クライアントはこれで停止する。</p>
+          </div>
+        </div>
+        <div class="callout warn"><span class="label">注意</span> <code>final</code> イベントには 2 つの異なるペイロードが存在する。ノードが発行する <code>{ "type": "final", "answer": ... }</code> と、ストリーム終端センチネルの文字列 <code>"[DONE]"</code> である。クライアントは <code>msg.data === "[DONE]"</code> を最優先で判定し、それ以外を JSON としてパースする。</div>
+
+        <h3>3.2 イベント種別一覧</h3>
+        <p>クライアントが識別する <code>type</code> は <code>types.ts</code> の <code>AgentEvent</code> 判別共用体で規定される。各イベントのペイロード構造を以下に示す。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>SSE event 名</th><th><code>type</code></th><th>主なフィールド</th><th>用途</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>status</code></td><td><code>status</code></td><td><code>node</code>, <code>state</code>, <code>message</code></td><td>ノードの稼働状況。<code>state</code> は <code>running</code> / <code>node_complete</code>。</td></tr>
+              <tr><td><code>thinking</code></td><td><code>thinking</code></td><td><code>agent</code>, <code>task_id?</code>, <code>content</code></td><td>サブエージェントの思考の逐次出力（追記で連結）。</td></tr>
+              <tr><td><code>token</code></td><td><code>token</code></td><td><code>agent</code>, <code>task_id?</code>, <code>content</code></td><td>最終回答（finalize）本文トークンの逐次出力。</td></tr>
+              <tr><td><code>plan</code></td><td><code>plan</code></td><td><code>tasks[]</code></td><td>プランナが生成したタスク一覧。</td></tr>
+              <tr><td><code>task_update</code></td><td><code>task_update</code></td><td><code>task_id</code>, <code>status</code>, <code>label</code></td><td>個別タスクの状態遷移。</td></tr>
+              <tr><td><code>evaluation</code></td><td><code>evaluation</code></td><td><code>passed</code>, <code>feedback</code></td><td>評価ノードの合否とフィードバック。</td></tr>
+              <tr><td><code>memory</code></td><td><code>memory</code></td><td><code>items[]</code></td><td>検索された長期記憶の一覧。</td></tr>
+              <tr><td><code>final</code></td><td><code>final</code></td><td><code>answer</code> または文字列 <code>"[DONE]"</code></td><td>最終回答（ノード発行）／ストリーム終端センチネル（終端）。</td></tr>
+              <tr><td><code>error</code></td><td><code>error</code></td><td><code>message</code></td><td>実行中の例外。<code>service.py</code> の <code>except</code> で送出。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>3.3 ペイロード詳細と JSON 例</h3>
+
+        <h3>status</h3>
+        <p>ストリーム開始時に <code>service.py</code> がまず <code>node="orchestrator"</code> / <code>state="running"</code> / <code>message="エージェント起動"</code> を送る。また <code>updates</code> モードのノード完了を <code>state="node_complete"</code>（<code>message</code> は空文字）に変換して送る。クライアントは <code>state==="running"</code> のときだけ <code>currentNode</code> を更新する。</p>
+        <pre><code>event: status
+data: {"type":"status","node":"orchestrator","state":"running","message":"エージェント起動"}
+
+event: status
+data: {"type":"status","node":"planner","state":"node_complete","message":""}</code></pre>
+
+        <h3>plan</h3>
+        <p><code>tasks</code> は各要素が <code>{ id, instruction, parallel_group }</code>。<code>parallel_group</code> は並列実行グループ番号。クライアントは <code>instruction</code> を <code>label</code>、<code>parallel_group</code> を <code>parallelGroup</code> にマッピングし、初期 <code>status</code> を <code>pending</code> とする。</p>
+        <pre><code>event: plan
+data: {"type":"plan","tasks":[
+  {"id":"t1","instruction":"資料を収集する","parallel_group":0},
+  {"id":"t2","instruction":"要点を整理する","parallel_group":1}
+]}</code></pre>
+
+        <h3>task_update</h3>
+        <p>個別タスクの状態遷移。<code>status</code> は <code>types.ts</code> の <code>TaskStatus</code>（<code>pending</code> / <code>running</code> / <code>done</code> / <code>error</code>）。クライアントは <code>task_id</code> で対象タスクを特定し、<code>label</code> が空でなければ更新する。</p>
+        <pre><code>event: task_update
+data: {"type":"task_update","task_id":"t1","status":"running","label":"資料を収集する"}</code></pre>
+
+        <h3>thinking</h3>
+        <p>サブエージェントの思考ストリーム。クライアントは直前のエントリと <code>agent</code> および <code>task_id</code>（未指定時は <code>null</code>）が一致する場合、<code>content</code> を末尾に追記してまとめる。</p>
+        <pre><code>event: thinking
+data: {"type":"thinking","agent":"planner","task_id":null,"content":"まず必要な"}
+
+event: thinking
+data: {"type":"thinking","agent":"planner","task_id":null,"content":"情報を洗い出す"}</code></pre>
+
+        <h3>token</h3>
+        <p>finalize 段階の最終回答本文を 1 トークンずつ送る。クライアントは <code>answer</code> 文字列に <code>content</code> を逐次追記する。</p>
+        <pre><code>event: token
+data: {"type":"token","agent":"finalize","task_id":null,"content":"こんに"}
+
+event: token
+data: {"type":"token","agent":"finalize","task_id":null,"content":"ちは"}</code></pre>
+
+        <h3>evaluation</h3>
+        <p>評価ノードの結果。<code>passed</code>（合否）と <code>feedback</code>（再計画用フィードバック）を持つ。</p>
+        <pre><code>event: evaluation
+data: {"type":"evaluation","passed":false,"feedback":"根拠の引用が不足している"}</code></pre>
+
+        <h3>memory</h3>
+        <p>検索された長期記憶の一覧を文字列配列 <code>items</code> で送る。クライアントは <code>memories</code> を丸ごと置き換える。</p>
+        <pre><code>event: memory
+data: {"type":"memory","items":["前回はTypeScriptを利用","東京在住"]}</code></pre>
+
+        <h3>final / 終端センチネル</h3>
+        <p>ノードが発行する <code>final</code> は <code>answer</code> を持ち、クライアントは <code>answer</code> が空でなければ最終回答に反映する。ストリーム末尾の終端センチネルは JSON ではなく文字列 <code>"[DONE]"</code> であり、クライアントは <code>msg.data === "[DONE]"</code> を検出した時点でストリームを停止・確定する。</p>
+        <pre><code>event: final
+data: {"type":"final","answer":"最終的な回答テキスト"}
+
+event: final
+data: "[DONE]"</code></pre>
+
+        <h3>error</h3>
+        <p>実行中に例外が発生した場合、<code>service.py</code> が <code>error</code> イベントを送ってからループを終える（その後も終端センチネルは送られる）。</p>
+        <pre><code>event: error
+data: {"type":"error","message":"&lt;例外メッセージ&gt;"}</code></pre>
+
+        <h2>4. 利用例</h2>
+
+        <h3>4.1 curl（SSE をそのまま観察）</h3>
+        <p><code>POST /chat/stream</code> に JSON ボディを送り、生の SSE フレームを標準出力で確認する例。</p>
+        <pre><code>curl -N -X POST http://localhost:8000/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message":"自己紹介して","user_id":"default-user"}'</code></pre>
+        <div class="callout tip"><span class="label">tip</span> <code>-N</code>（<code>--no-buffer</code>）を付けないと SSE がバッファリングされ、逐次受信が観察できない。</div>
+
+        <h3>4.2 fetch + EventSource 的な受信（フロント実装に即して）</h3>
+        <p>実装では標準 <code>EventSource</code> ではなく、POST ボディを送れる <code>@microsoft/fetch-event-source</code> の <code>fetchEventSource</code> を使う。<code>useAgentStream.ts</code> の <code>send()</code> に準ずる最小例を示す。</p>
+        <pre><code>import { fetchEventSource } from "@microsoft/fetch-event-source";
+
+const ctrl = new AbortController();
+await fetchEventSource("/chat/stream", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ message, user_id: "default-user" }),
+  signal: ctrl.signal,
+  openWhenHidden: true, // バックグラウンドタブでも継続
+  onmessage(msg) {
+    if (msg.data === "[DONE]") { ctrl.abort(); return; } // 終端
+    if (!msg.data) return;
+    const ev = JSON.parse(msg.data); // AgentEvent
+    // ev.type で分岐（status / plan / thinking / token ...）
+  },
+  onerror(err) { throw err; }, // 自動リトライを止める
+});</code></pre>
+        <div class="callout note"><span class="label">受信契約</span> <code>onmessage</code> は <code>"[DONE]"</code> を最優先で判定し、空 <code>data</code> をスキップ、それ以外を <code>JSON.parse</code> して <code>AgentEvent</code> として処理する。パースできないフレームは無視される。<code>onerror</code> で例外を再 <code>throw</code> することでライブラリの自動リトライを停止している。</div>
+
+        <h3>4.3 クライアント側の中断とサーバ側の打ち切り</h3>
+        <div class="diagram"><pre>クライアント                          サーバ (main.py)
+   │  AbortController.abort()             │
+   │ ───────────────────────────────────▶│ request.is_disconnected() == True
+   │                                      │   → event_source ループを break
+   │  ("[DONE]" 受信でも abort)            │   (無駄な計算を停止)</pre></div>
+        <p><code>main.py</code> の <code>event_source()</code> は各イベント送出前に <code>request.is_disconnected()</code> を確認し、クライアント切断時はループを <code>break</code> して以降の計算を打ち切る。</p>
+
+        <h2>5. CORS / ミドルウェア設定</h2>
+        <p><code>main.py</code> は <code>CORSMiddleware</code> を 1 つだけ登録している。許可オリジンは設定値 <code>settings.frontend_origin</code> の単一オリジン。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>項目</th><th>設定値</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>allow_origins</code></td><td><code>[settings.frontend_origin]</code>（単一オリジン）</td></tr>
+              <tr><td><code>allow_credentials</code></td><td><code>True</code></td></tr>
+              <tr><td><code>allow_methods</code></td><td><code>["*"]</code></td></tr>
+              <tr><td><code>allow_headers</code></td><td><code>["*"]</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code>app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[settings.frontend_origin],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)</code></pre>
+
+        <h3>ライフサイクル（lifespan）</h3>
+        <p>FastAPI の <code>lifespan</code> コンテキストで、起動時に埋め込み次元チェック（<code>assert_embed_dims</code>）と PostgreSQL 記憶ストア初期化（<code>setup_store</code>）を行い、終了時に <code>teardown_store</code> を呼ぶ。いずれの初期化も失敗時は <code>warning</code> ログを出して継続する（記憶検索／永続化が無効になりうる）。</p>
+        <div class="diagram"><pre>startup
+  ├─ assert_embed_dims()   失敗 → warning（記憶検索が動かない可能性）
+  └─ setup_store()         失敗 → warning（記憶が永続化されません）
+        │  yield（リクエスト処理）
+        ▼
+shutdown
+  └─ teardown_store()</pre></div>
+
+        <footer class="doc-footer">
+          <div>LangGraph オーケストレータ エージェント — 設計書</div>
+          <div class="nav-links"><a href="memory-design.html">&larr; 長期記憶設計</a><a href="sequence-flow.html">処理フロー &rarr;</a></div>
+        </footer>
+      </article>
+    </div>
+  </div>
+</body>
+</html>

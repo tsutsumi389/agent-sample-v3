@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>長期記憶設計 — LangGraph オーケストレータ 設計書</title>
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a class="brand" href="index.html">LangGraph オーケストレータ
+        <span class="sub">設計書 / Design Docs</span>
+      </a>
+      <nav>
+        <div class="group-title">概観</div>
+        <a href="overview.html">システム概要</a>
+        <a href="architecture.html">アーキテクチャ</a>
+        <div class="group-title">詳細設計</div>
+        <a href="backend-design.html">バックエンド設計</a>
+        <a href="frontend-design.html">フロントエンド設計</a>
+        <a href="memory-design.html" class="active">長期記憶設計</a>
+        <div class="group-title">インタフェース</div>
+        <a href="api-spec.html">API / SSE 仕様</a>
+        <a href="sequence-flow.html">処理フロー</a>
+      </nav>
+    </aside>
+    <div class="content">
+      <article>
+        <p class="page-eyebrow">詳細設計 / 長期記憶</p>
+        <h1>長期記憶設計</h1>
+        <p class="lead">本章では、会話をまたいでユーザーに関する知識を蓄積・想起する長期記憶サブシステムを解説する。記憶は <code>LangMem</code> によって抽出され、pgvector を有効化した PostgreSQL に <code>AsyncPostgresStore</code> 経由で永続化される。読み出しはオーケストレータの <code>recall_memory</code> ノードで、書き込みは応答生成後の背景タスクで行われ、両者は <code>nomic-embed-text</code>(768 次元)の埋め込みによる意味検索で結ばれる。</p>
+
+        <h2>1. 長期記憶アーキテクチャ</h2>
+        <p>記憶のライフサイクルは「想起(recall)→ LLM 応答 → 背景での記憶化(LangMem)→ 永続化」という流れで構成される。永続化レイヤは <code>AsyncPostgresStore</code> を介した PostgreSQL + pgvector であり、埋め込みは <code>nomic-embed-text</code> による 768 次元ベクトルである。</p>
+        <div class="diagram"><pre>
+   ┌──────────────────────── Orchestrator (親グラフ) ────────────────────────┐
+   │                                                                         │
+   │   START                                                                 │
+   │     │                                                                   │
+   │     ▼                                                                   │
+   │  recall_memory ──── recall_memories(user_id, query) ──┐                 │
+   │     │                                                 │  asearch        │
+   │     ▼                          retrieved_memories     ▼  (意味検索)     │
+   │  planner → executor×N → evaluator → finalize     ┌─────────────────┐    │
+   │                                       │           │ AsyncPostgres   │    │
+   │                                       │ answer     │ Store           │    │
+   │                                       ▼           │   namespace =    │    │
+   │                              remember_async(...)   │ ("memories",    │    │
+   │                                       │            │   user_id)      │    │
+   │                                       ▼            └────────┬────────┘   │
+   │                          ReflectionExecutor.submit          │           │
+   │                          (背景スレッド / after 0.5s)         │ aput      │
+   └──────────────────────────────────────────────────│─────────┼───────────┘
+                                                       │         │
+                          埋め込み: nomic-embed-text    ▼         ▼
+                          (768次元) ───────────►  ┌─────────────────────────┐
+                                                  │ PostgreSQL + pgvector    │
+                                                  │ (docker-compose db)      │
+                                                  │  vector(768) で類似検索   │
+                                                  └─────────────────────────┘
+        </pre></div>
+        <div class="grid">
+          <div class="card">
+            <h3>想起(read path)</h3>
+            <p><code>recall_memory</code> ノードが <code>recall_memories()</code> を呼び、<code>store.asearch</code> で関連記憶を取得して <code>retrieved_memories</code> として State に書き込む。これが planner に渡る。</p>
+          </div>
+          <div class="card">
+            <h3>記憶化(write path)</h3>
+            <p><code>finalize</code> が応答生成後に <code>remember_async()</code> を呼ぶ。<code>ReflectionExecutor.submit</code> が背景で会話から記憶を抽出・統合し、ストアへ <code>aput</code> する。</p>
+          </div>
+          <div class="card">
+            <h3>永続化(store)</h3>
+            <p><code>AsyncPostgresStore</code> が pgvector 上に記憶を保存。プロセスを再起動しても記憶は残り、名前空間 <code>("memories", user_id)</code> でユーザー単位に分離される。</p>
+          </div>
+        </div>
+
+        <h2>2. AsyncPostgresStore の設定・接続・初期化</h2>
+        <p>ストアは <code>backend/app/memory.py</code> で <code>langgraph.store.postgres.aio.AsyncPostgresStore</code> として構築される。非同期コンテキストマネージャであるため、ストア本体 <code>store</code> と CM <code>_store_cm</code> をモジュールグローバルに分けて保持し、アプリのライフサイクル(<code>main.py</code> の lifespan)に合わせて手動で enter/exit する。</p>
+        <pre><code>_store_cm = AsyncPostgresStore.from_conn_string(
+    settings.database_url,
+    index={
+        "dims": settings.embed_dims,   # nomic-embed-text = 768 固定
+        "embed": get_embeddings(),
+        "fields": ["text"],
+    },
+)
+store = await _store_cm.__aenter__()
+await store.setup()</code></pre>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>項目</th><th>値 / 出典</th><th>説明</th></tr></thead>
+            <tbody>
+              <tr><td>接続文字列</td><td><code>settings.database_url</code></td><td>既定 <code>postgresql://agent:agent@localhost:5432/agent</code>(<code>config.py</code>)。docker-compose の db サービスに対応。</td></tr>
+              <tr><td>埋め込み次元</td><td><code>settings.embed_dims</code> = 768</td><td><code>index.dims</code> に渡され、ベクトル列の次元を確定する。</td></tr>
+              <tr><td>埋め込みモデル</td><td><code>get_embeddings()</code></td><td><code>nomic-embed-text</code>。<code>index.embed</code> に渡され検索/保存時に使われる。</td></tr>
+              <tr><td>索引対象フィールド</td><td><code>fields: ["text"]</code></td><td>記憶レコードの <code>text</code> フィールドをベクトル化対象とする。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note"><span class="label">初期化と破棄</span><p><code>setup_store()</code> は接続プール確立後に <code>store.setup()</code> を実行し、pgvector 拡張の有効化とテーブル作成(IF NOT EXISTS)を行う。冪等なので再起動時の再実行も安全。<code>teardown_store()</code> は CM を <code>__aexit__</code> し、<code>store</code> / <code>_store_cm</code> / リフレクション関連のグローバルを <code>None</code> にリセットして接続プールを破棄する。</p></div>
+
+        <h2>3. 記憶の検索(recall_memories)と保存(背景タスク)</h2>
+        <h3>3.1 検索: recall_memories</h3>
+        <p><code>recall_memories(user_id, query, limit=5)</code> は名前空間 <code>("memories", user_id)</code> に対して <code>store.asearch(query=...)</code> を実行し、ヒットした各レコードの <code>value</code> から <code>text</code> →(無ければ)<code>content</code> →(さらに無ければ)<code>value</code> 自体の順でテキストを取り出してリスト化する。オーケストレータの <code>recall_memory</code> ノードがこれを呼び、SSE に <code>memory</code> イベントと取得件数の <code>status</code> を流したうえで <code>retrieved_memories</code> として State に書き込む。</p>
+        <h3>3.2 保存: remember_async と ReflectionExecutor</h3>
+        <p>記憶化はホットパスをブロックしないよう背景で行う。<code>finalize</code> が <code>remember_async(user_id, user_message, assistant_message)</code> を呼ぶと、<code>user</code> / <code>assistant</code> の 2 メッセージを payload に組み立て、<code>ReflectionExecutor.submit(payload, after_seconds=0.5, config={"configurable": {"user_id": ...}})</code> で背景投入する。</p>
+        <div class="steps">
+          <ol>
+            <li><code>_get_reflection()</code> がリフレクション実行器を遅延初期化する(初回呼び出しで一度だけ構築、<code>_reflection_ready</code> フラグで管理)。</li>
+            <li><code>store</code> が未初期化なら構築せず <code>None</code> を返し、次回に再試行する。</li>
+            <li>構築時は <code>create_memory_store_manager(get_chat_llm(streaming=False), namespace=NAMESPACE, store=store)</code> でマネージャを作り、<code>ReflectionExecutor(manager, store=store)</code> を生成する。</li>
+            <li><code>submit</code> 後、背景で会話から記憶が抽出・統合され、同じ名前空間にベクトル付きで保存される。</li>
+          </ol>
+        </div>
+        <div class="callout note"><span class="label">名前空間の一致</span><p>記憶の名前空間は <code>NAMESPACE = ("memories", "{user_id}")</code> として定義され、書き込み(<code>create_memory_store_manager</code> の namespace)と読み出し(<code>recall_memories</code> の <code>("memories", user_id)</code>)で完全に一致させる必要がある。一致しないと保存した記憶が検索でヒットしない。</p></div>
+
+        <h2>4. pgvector によるベクトル検索と次元の固定</h2>
+        <p>意味検索は pgvector の vector 型カラムに対する類似度検索で実現される。検索時はクエリ文字列を <code>nomic-embed-text</code> でベクトル化し、保存済みの記憶ベクトルとの近傍を求める。<code>index.dims</code> がベクトル列の次元を確定するため、埋め込みモデルの出力次元と一致していなければならない。</p>
+        <p>本システムは <code>embed_dims = 768</code> を <code>nomic-embed-text</code> の固定次元として扱う。起動時の健全性チェック <code>assert_embed_dims()</code> が実際の埋め込み次元(<code>embed_query("dimension probe")</code> の長さ)を計測し、<code>settings.embed_dims</code> と不一致なら <code>RuntimeError</code> を送出する。</p>
+        <pre><code>def assert_embed_dims() -> int:
+    dim = len(get_embeddings().embed_query("dimension probe"))
+    if dim != settings.embed_dims:
+        raise RuntimeError(
+            f"埋め込み次元が想定と不一致: 実際={dim}, 期待={settings.embed_dims}. ..."
+        )
+    return dim</code></pre>
+        <div class="callout warn"><span class="label">次元固定の理由</span><p>コメントによれば、古い/壊れた埋め込みモデルのタグだと 8192 を返すことがあり、その場合に意味検索が「静かに壊れる」(エラーにならず精度だけ劣化する)。これを起動時に検知するため、768 を期待値として明示的にアサートしている。テスト <code>test_embed_dims_is_768</code> も <code>assert assert_embed_dims() == 768</code> でこの不変条件を固定している。</p></div>
+
+        <h2>5. DB 未起動時のフォールバック</h2>
+        <p>長期記憶は補助機能であり、PostgreSQL が起動していなくてもチャット自体は継続できるよう設計されている。記憶の検索・保存はスキップされ、空の結果や no-op に縮退する。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>状況</th><th>挙動</th></tr></thead>
+            <tbody>
+              <tr><td><code>store</code> が <code>None</code>(未初期化)で <code>recall_memories</code> 呼び出し</td><td>即座に空リスト <code>[]</code> を返す。</td></tr>
+              <tr><td><code>store.asearch</code> が例外送出</td><td>warning ログを出し、空リスト <code>[]</code> を返す(検索失敗で会話は止めない)。</td></tr>
+              <tr><td><code>store</code> 未初期化で記憶化(<code>_get_reflection</code>)</td><td>リフレクション実行器を構築せず <code>None</code> を返し、<code>remember_async</code> は何もせず return する。</td></tr>
+              <tr><td>LangMem マネージャ初期化失敗</td><td>warning ログを出し <code>_reflection = None</code> とする(記憶化スキップ)。</td></tr>
+              <tr><td><code>remember_async</code> の <code>submit</code> 失敗</td><td>warning ログを出して握りつぶす(背景記憶化失敗で応答は返す)。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><span class="label">縮退時の方針</span><p>DB 未起動・接続失敗時はいずれも例外を握りつぶして warning ログにとどめ、<code>recall_memory</code> は <code>0 件の記憶を取得</code>、<code>finalize</code> は記憶化を no-op としてチャットフローを完走させる。記憶機能の喪失とチャットの可用性を切り離している。</p></div>
+
+        <h2>6. docker-compose の構成</h2>
+        <p>永続化先 PostgreSQL は <code>docker-compose.yml</code> の <code>db</code> サービスとして定義される。pgvector 拡張入りイメージを採用し、意味検索の埋め込みベクトルを格納する。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>項目</th><th>設定</th></tr></thead>
+            <tbody>
+              <tr><td>イメージ</td><td><code>pgvector/pgvector:pg16</code></td></tr>
+              <tr><td>コンテナ名</td><td><code>agent-postgres</code></td></tr>
+              <tr><td>認証 / DB</td><td>USER=<code>agent</code> / PASSWORD=<code>agent</code> / DB=<code>agent</code></td></tr>
+              <tr><td>ポート</td><td><code>5432:5432</code></td></tr>
+              <tr><td>永続ボリューム</td><td><code>pgdata:/var/lib/postgresql/data</code></td></tr>
+              <tr><td>ヘルスチェック</td><td><code>pg_isready -U agent -d agent</code>(interval 5s / timeout 5s / retries 5)</td></tr>
+              <tr><td>接続文字列</td><td><code>postgresql://agent:agent@localhost:5432/agent</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>テーブルや拡張の作成はマイグレーションファイルではなく <code>store.setup()</code> によってアプリ起動時に自動で行われる(pgvector 拡張の有効化とテーブルの IF NOT EXISTS 作成)。<span class="pill blue">起動</span> <code>docker compose up -d</code> で db を立ち上げ、アプリの lifespan で <code>setup_store()</code> が初期化する。<code>backend/tests/test_memory.py</code> も冒頭コメントで「<code>docker compose up -d</code> で db サービスが起動していること」を前提とし、実 Ollama 埋め込み + 実 PostgreSQL/pgvector で put/search のラウンドトリップ(<code>test_put_and_search_roundtrip</code>)を検証している。</p>
+        <div class="callout tip"><span class="label">参照ファイル</span><p>記憶ロジック: <code>backend/app/memory.py</code> / 設定: <code>backend/app/config.py</code> / 呼び出し元: <code>backend/app/orchestrator.py</code>(<code>recall_memory</code>・<code>finalize</code>) / インフラ: <code>docker-compose.yml</code> / 検証: <code>backend/tests/test_memory.py</code></p></div>
+
+        <footer class="doc-footer">
+          <div>LangGraph オーケストレータ エージェント — 設計書</div>
+          <div class="nav-links"><a href="frontend-design.html">&larr; フロントエンド設計</a><a href="api-spec.html">API / SSE 仕様 &rarr;</a></div>
+        </footer>
+      </article>
+    </div>
+  </div>
+</body>
+</html>
