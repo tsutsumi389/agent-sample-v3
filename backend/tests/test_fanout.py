@@ -11,9 +11,9 @@ from app.orchestrator import assign_executors
 def test_assign_executors_emits_parallel_sends():
     state = {
         "plan": [
-            {"id": "t1", "instruction": "A", "parallel_group": 0, "depends_on": []},
-            {"id": "t2", "instruction": "B", "parallel_group": 0, "depends_on": []},
-            {"id": "t3", "instruction": "C", "parallel_group": 0, "depends_on": []},
+            {"id": "t1", "instruction": "A", "parallel_group": 0},
+            {"id": "t2", "instruction": "B", "parallel_group": 0},
+            {"id": "t3", "instruction": "C", "parallel_group": 0},
         ]
     }
     # get_stream_writer はグラフ実行外では no-op を返すので直接呼べる

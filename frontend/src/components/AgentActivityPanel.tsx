@@ -1,16 +1,7 @@
 import type { ChatState } from "../types";
+import { NODE_LABELS } from "../labels";
 import { TaskChecklist } from "./TaskChecklist";
 import { ThoughtsFeed } from "./ThoughtsFeed";
-
-const NODE_LABELS: Record<string, string> = {
-  orchestrator: "オーケストレータ",
-  memory: "記憶想起",
-  recall_memory: "記憶想起",
-  planner: "プランナー",
-  executor: "エグゼキューター",
-  evaluator: "エヴァリュエーター",
-  finalize: "最終統合",
-};
 
 export function AgentActivityPanel({ state }: { state: ChatState }) {
   return (

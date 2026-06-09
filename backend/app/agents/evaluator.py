@@ -11,23 +11,20 @@ from langgraph.graph import END, START, StateGraph
 
 from ..agent_utils import parse_json, stream_agent
 from ..llm import get_chat_llm
-from ..schemas import Evaluation, EvaluatorState
+from ..schemas import Evaluation, EvaluatorState, empty_evaluation
 
 SYSTEM = """あなたは品質評価者です。ユーザーの元の要求と、各タスクの実行結果を
 読み、要求が十分に満たされているか判定してください。
 
 必ず次の JSON のみを出力してください(前後に説明文を書かない):
-{"passed": true/false, "feedback": "改善点や不足。passedがtrueなら空文字でよい",
- "retry_instructions": ["再実行すべき具体的な指示", "..."]}
+{"passed": true/false, "feedback": "改善点や不足。passedがtrueなら空文字でよい"}
 """
 
 
 def _normalize(raw: dict) -> Evaluation:
-    passed = bool(raw.get("passed", True))
     return {
-        "passed": passed,
+        "passed": bool(raw.get("passed", True)),
         "feedback": str(raw.get("feedback", "")),
-        "retry_instructions": [str(x) for x in raw.get("retry_instructions", []) if x],
     }
 
 
@@ -46,14 +43,14 @@ async def _evaluate(state: EvaluatorState) -> dict:
     )
 
     content, _ = await stream_agent(
-        llm := get_chat_llm(),
+        get_chat_llm(),
         [("system", SYSTEM), ("human", human)],
         agent="evaluator",
         writer=writer,
     )
 
     parsed = parse_json(content)
-    evaluation = _normalize(parsed) if parsed else {"passed": True, "feedback": "", "retry_instructions": []}
+    evaluation = _normalize(parsed) if parsed else empty_evaluation()
 
     writer(
         {

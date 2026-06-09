@@ -19,7 +19,7 @@ from .agent_utils import safe_writer, stream_agent
 from .config import settings
 from .llm import get_chat_llm
 from .memory import recall_memories, remember_async
-from .schemas import ParentState
+from .schemas import ParentState, empty_evaluation
 
 FINALIZE_SYSTEM = """あなたはオーケストレータの統括役です。各サブタスクの結果を
 統合し、ユーザーの元の要求に対する最終回答を分かりやすくまとめてください。"""
@@ -87,7 +87,7 @@ async def evaluator_node(state: ParentState) -> dict:
         {"request": state["user_request"], "results": state.get("task_results", [])}
     )
     return {
-        "evaluation": out.get("evaluation", {"passed": True, "feedback": "", "retry_instructions": []}),
+        "evaluation": out.get("evaluation", empty_evaluation()),
         "iteration": state.get("iteration", 0) + 1,
     }
 
