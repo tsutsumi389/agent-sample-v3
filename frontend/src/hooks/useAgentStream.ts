@@ -12,6 +12,7 @@ const initialState: ChatState = {
   evaluation: null,
   answer: "",
   messages: [],
+  error: null,
 };
 
 type Action =
@@ -25,19 +26,19 @@ function reducer(state: ChatState, action: Action): ChatState {
     case "start":
       return {
         ...initialState,
-        messages: [...state.messages, { role: "user", content: action.message }],
+        messages: [...state.messages, { role: "user", content: action.message, at: Date.now() }],
         running: true,
         statusMessage: "起動中…",
       };
     case "finish": {
       // ストリーミングした answer を確定メッセージにコミット
       const msgs = state.answer
-        ? [...state.messages, { role: "assistant" as const, content: state.answer }]
+        ? [...state.messages, { role: "assistant" as const, content: state.answer, at: Date.now() }]
         : state.messages;
       return { ...state, running: false, currentNode: null, messages: msgs, answer: "" };
     }
     case "fail":
-      return { ...state, running: false, statusMessage: `エラー: ${action.message}` };
+      return { ...state, running: false, error: action.message };
     case "event":
       return applyEvent(state, action.event);
   }
@@ -89,7 +90,7 @@ function applyEvent(state: ChatState, ev: AgentEvent): ChatState {
     case "final":
       return { ...state, answer: ev.answer || state.answer };
     case "error":
-      return { ...state, statusMessage: `エラー: ${ev.message}` };
+      return { ...state, error: ev.message };
   }
 }
 
@@ -99,6 +100,8 @@ export function useAgentStream() {
 
   const send = useCallback(async (message: string, userId = "default-user") => {
     if (!message.trim()) return;
+    // 進行中の接続が残っていれば打ち切ってから開始(二重送信対策)
+    ctrlRef.current?.abort();
     dispatch({ kind: "start", message });
 
     const ctrl = new AbortController();
@@ -126,7 +129,13 @@ export function useAgentStream() {
           }
         },
         onerror(err) {
-          dispatch({ kind: "fail", message: String(err) });
+          // ユーザー操作による中断はエラー表示しない
+          if (!ctrl.signal.aborted) {
+            dispatch({
+              kind: "fail",
+              message: "サーバーに接続できませんでした。バックエンドの起動状態を確認してください。",
+            });
+          }
           throw err; // 自動リトライを止める
         },
       });
