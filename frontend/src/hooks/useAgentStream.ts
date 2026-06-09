@@ -91,6 +91,9 @@ function applyEvent(state: ChatState, ev: AgentEvent): ChatState {
       return { ...state, answer: ev.answer || state.answer };
     case "error":
       return { ...state, error: ev.message };
+    default:
+      // 未知のイベントで state を壊さない(後方互換のための防御)
+      return state;
   }
 }
 
@@ -115,18 +118,22 @@ export function useAgentStream() {
         signal: ctrl.signal,
         openWhenHidden: true, // バックグラウンドタブでも実行を継続
         onmessage(msg) {
-          if (msg.data === "[DONE]") {
+          if (!msg.data) return;
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(msg.data);
+          } catch {
+            // パースできないフレームは無視
+            return;
+          }
+          // 終端センチネル。バックエンドは json.dumps を通すため
+          // ワイヤ上は `data: "[DONE]"`(引用符付き)になる
+          if (parsed === "[DONE]" || msg.data === "[DONE]") {
             dispatch({ kind: "finish" });
             ctrl.abort();
             return;
           }
-          if (!msg.data) return;
-          try {
-            const parsed = JSON.parse(msg.data) as AgentEvent;
-            dispatch({ kind: "event", event: parsed });
-          } catch {
-            // パースできないフレームは無視
-          }
+          dispatch({ kind: "event", event: parsed as AgentEvent });
         },
         onerror(err) {
           // ユーザー操作による中断はエラー表示しない
