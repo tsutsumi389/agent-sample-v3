@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,13 +11,34 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from .config import settings
-from .memory import assert_embed_dims
+from .memory import assert_embed_dims, setup_store, teardown_store
 from .service import run_agent_stream
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LangGraph Orchestrator Agent")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        dim = assert_embed_dims()
+        logger.info("埋め込み次元チェックOK: %d", dim)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("埋め込み次元チェックに失敗(記憶検索が動かない可能性): %s", exc)
+
+    try:
+        await setup_store()
+        logger.info("PostgreSQL 記憶ストアを初期化しました: %s", settings.database_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PostgreSQL ストア初期化に失敗(記憶が永続化されません): %s", exc)
+
+    try:
+        yield
+    finally:
+        await teardown_store()
+
+
+app = FastAPI(title="LangGraph Orchestrator Agent", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,15 +53,6 @@ class ChatRequest(BaseModel):
     message: str
     user_id: str = "default-user"
     thread_id: str | None = None
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    try:
-        dim = assert_embed_dims()
-        logger.info("埋め込み次元チェックOK: %d", dim)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("埋め込み次元チェックに失敗(記憶検索が動かない可能性): %s", exc)
 
 
 @app.get("/health")

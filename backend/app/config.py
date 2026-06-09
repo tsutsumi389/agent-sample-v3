@@ -18,5 +18,9 @@ class Settings(BaseSettings):
 
     frontend_origin: str = "http://localhost:5173"
 
+    # 長期記憶(LangMem)を永続化する PostgreSQL(pgvector)接続文字列。
+    # docker-compose.yml の db サービスがこの値に対応している。
+    database_url: str = "postgresql://agent:agent@localhost:5432/agent"
+
 
 settings = Settings()
